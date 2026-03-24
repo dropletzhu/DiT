@@ -3,9 +3,18 @@ import torch
 import argparse
 from typing import Optional
 
+_device_override = None
+
+def set_device_override(device_type):
+    """Override device detection (for CLI args)"""
+    global _device_override
+    _device_override = device_type
 
 def get_device_type():
     """Detect and return device type: 'npu', 'cuda', 'cpu'"""
+    global _device_override
+    if _device_override is not None:
+        return _device_override
     if hasattr(torch, 'npu') and torch.npu.is_available():
         return 'npu'
     elif torch.cuda.is_available():
@@ -59,8 +68,14 @@ def enable_tf32(enabled: bool = True):
 
 
 def get_distributed_backend():
-    """Return distributed backend: 'hccl' (NPU) / 'nccl' (CUDA)"""
-    return 'hccl' if get_device_type() == 'npu' else 'nccl'
+    """Return distributed backend: 'hccl' (NPU) / 'nccl' (CUDA) / 'gloo' (CPU)"""
+    device_type = get_device_type()
+    if device_type == 'npu':
+        return 'hccl'
+    elif device_type == 'cuda':
+        return 'nccl'
+    else:
+        return 'gloo'
 
 
 def get_autocast(enabled: bool = True, dtype=torch.float16):

@@ -26,8 +26,8 @@ import logging
 import os
 
 from utils import (
-    get_device_count, set_device, synchronize, enable_tf32,
-    get_distributed_backend, get_autocast, get_amp_scaler, add_device_args
+    get_device_count, get_device_type, set_device, synchronize, enable_tf32,
+    get_distributed_backend, get_autocast, get_amp_scaler, add_device_args, set_device_override
 )
 from models import DiT_models
 from diffusion import create_diffusion
@@ -127,8 +127,14 @@ def main(args):
     dist.init_process_group(get_distributed_backend())
     assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
     rank = dist.get_rank()
-    device = rank % device_count
-    set_device(device)
+    device_type = get_device_type()
+    if device_type == 'cpu':
+        device = torch.device('cpu')
+        device_id = None
+    else:
+        device_id = rank % device_count
+        device = device_id
+        set_device(device_id)
     seed = args.global_seed * dist.get_world_size() + rank
     torch.manual_seed(seed)
     print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}, device={device}.")
@@ -156,7 +162,10 @@ def main(args):
     # Note that parameter initialization is done within the DiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
-    model = DDP(model.to(device), device_ids=[rank])
+    if device_type == 'cpu':
+        model = DDP(model.to(device))
+    else:
+        model = DDP(model.to(device), device_ids=[device_id])
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -287,4 +296,6 @@ if __name__ == "__main__":
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping value (0 to disable)")
     add_device_args(parser)
     args = parser.parse_args()
+    if args.device != "auto":
+        set_device_override(args.device)
     main(args)
