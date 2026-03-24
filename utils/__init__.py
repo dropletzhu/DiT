@@ -1,0 +1,34 @@
+# utils/__init__.py - Device abstraction utilities for GPU and NPU support
+from .device_utils import (
+    get_device,
+    get_device_str,
+    get_device_type,
+    get_device_count,
+    set_device,
+    synchronize,
+    enable_tf32,
+    get_distributed_backend,
+    get_autocast,
+    get_amp_scaler,
+    is_npu,
+    is_cuda,
+    is_available,
+    add_device_args,
+)
+
+__all__ = [
+    "get_device",
+    "get_device_str",
+    "get_device_type",
+    "get_device_count",
+    "set_device",
+    "synchronize",
+    "enable_tf32",
+    "get_distributed_backend",
+    "get_autocast",
+    "get_amp_scaler",
+    "is_npu",
+    "is_cuda",
+    "is_available",
+    "add_device_args",
+]

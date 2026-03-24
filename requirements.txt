@@ -1,0 +1,17 @@
+# Core dependencies
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Optional: NPU support (install if using Ascend NPU)
+# torch-npu>=2.10.0rc2
+
+# Model dependencies
+timm>=0.9.0
+diffusers>=0.25.0
+
+# Data processing
+numpy>=1.21.0
+pillow>=9.0.0
+
+# Progress bars
+tqdm>=4.65.0

@@ -9,7 +9,7 @@ Samples a large number of images from a pre-trained DiT model using DDP.
 Subsequently saves a .npz file that can be used to compute FID and other
 evaluation metrics via the ADM repo: https://github.com/openai/guided-diffusion/tree/main/evaluations
 
-For a simple single-GPU/CPU sampling script, see sample.py.
+Supports GPU and Ascend NPU. For a simple single-GPU/CPU sampling script, see sample.py.
 """
 import torch
 import torch.distributed as dist
@@ -23,6 +23,11 @@ from PIL import Image
 import numpy as np
 import math
 import argparse
+
+from utils import (
+    enable_tf32, get_device_count, set_device, synchronize,
+    get_distributed_backend, get_autocast, add_device_args
+)
 
 
 def create_npz_from_sample_folder(sample_dir, num=50_000):
@@ -44,20 +49,25 @@ def create_npz_from_sample_folder(sample_dir, num=50_000):
 
 def main(args):
     """
-    Run sampling.
+    Run sampling with DDP.
+    Supports GPU and NPU.
     """
-    torch.backends.cuda.matmul.allow_tf32 = args.tf32  # True: fast but may lead to some small numerical differences
-    assert torch.cuda.is_available(), "Sampling with DDP requires at least one GPU. sample.py supports CPU-only usage"
+    enable_tf32(args.tf32)
+    device_count = get_device_count()
+    assert device_count >= 1, "Sampling with DDP requires at least one GPU or NPU."
     torch.set_grad_enabled(False)
 
+    amp_enabled = args.amp and not args.no_amp
+    amp_dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
+
     # Setup DDP:
-    dist.init_process_group("nccl")
+    dist.init_process_group(get_distributed_backend())
     rank = dist.get_rank()
-    device = rank % torch.cuda.device_count()
+    device = rank % device_count
+    set_device(device)
     seed = args.global_seed * dist.get_world_size() + rank
     torch.manual_seed(seed)
-    torch.cuda.set_device(device)
-    print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
+    print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}, device={device}.")
 
     if args.ckpt is None:
         assert args.model == "DiT-XL/2", "Only DiT-XL/2 models are available for auto-download."
@@ -106,11 +116,9 @@ def main(args):
     pbar = tqdm(pbar) if rank == 0 else pbar
     total = 0
     for _ in pbar:
-        # Sample inputs:
         z = torch.randn(n, model.in_channels, latent_size, latent_size, device=device)
         y = torch.randint(0, args.num_classes, (n,), device=device)
 
-        # Setup classifier-free guidance:
         if using_cfg:
             z = torch.cat([z, z], 0)
             y_null = torch.tensor([1000] * n, device=device)
@@ -121,14 +129,15 @@ def main(args):
             model_kwargs = dict(y=y)
             sample_fn = model.forward
 
-        # Sample images:
-        samples = diffusion.p_sample_loop(
-            sample_fn, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=False, device=device
-        )
+        with get_autocast(amp_enabled, amp_dtype):
+            samples = diffusion.p_sample_loop(
+                sample_fn, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=False, device=device
+            )
         if using_cfg:
-            samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
+            samples, _ = samples.chunk(2, dim=0)
 
-        samples = vae.decode(samples / 0.18215).sample
+        with get_autocast(amp_enabled, amp_dtype):
+            samples = vae.decode(samples / 0.18215).sample
         samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
 
         # Save samples to disk as individual .png files
@@ -162,5 +171,6 @@ if __name__ == "__main__":
                         help="By default, use TF32 matmuls. This massively accelerates sampling on Ampere GPUs.")
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a DiT checkpoint (default: auto-download a pre-trained DiT-XL/2 model).")
+    add_device_args(parser)
     args = parser.parse_args()
     main(args)

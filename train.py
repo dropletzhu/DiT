@@ -6,11 +6,9 @@
 
 """
 A minimal training script for DiT using PyTorch DDP.
+Supports GPU and Ascend NPU with optional AMP.
 """
 import torch
-# the first flag below was False when we tested this script but True makes A100 training a lot faster:
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
@@ -27,6 +25,10 @@ import argparse
 import logging
 import os
 
+from utils import (
+    get_device_count, set_device, synchronize, enable_tf32,
+    get_distributed_backend, get_autocast, get_amp_scaler, add_device_args
+)
 from models import DiT_models
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
@@ -110,18 +112,26 @@ def center_crop_arr(pil_image, image_size):
 def main(args):
     """
     Trains a new DiT model.
+    Supports GPU, NPU, and AMP.
     """
-    assert torch.cuda.is_available(), "Training currently requires at least one GPU."
+    enable_tf32(True)
+    
+    amp_enabled = args.amp and not args.no_amp
+    amp_dtype = torch.bfloat16 if args.dtype == "bf16" else torch.float16
+    scaler = get_amp_scaler(amp_enabled)
+    
+    device_count = get_device_count()
+    assert device_count >= 1, "Training currently requires at least one GPU or NPU."
 
     # Setup DDP:
-    dist.init_process_group("nccl")
+    dist.init_process_group(get_distributed_backend())
     assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
     rank = dist.get_rank()
-    device = rank % torch.cuda.device_count()
+    device = rank % device_count
+    set_device(device)
     seed = args.global_seed * dist.get_world_size() + rank
     torch.manual_seed(seed)
-    torch.cuda.set_device(device)
-    print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
+    print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}, device={device}.")
 
     # Setup an experiment folder:
     if rank == 0:
@@ -191,7 +201,7 @@ def main(args):
     running_loss = 0
     start_time = time()
 
-    logger.info(f"Training for {args.epochs} epochs...")
+    logger.info(f"Training for {args.epochs} epochs (AMP: {amp_enabled}, dtype: {amp_dtype})...")
     for epoch in range(args.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
@@ -199,15 +209,27 @@ def main(args):
             x = x.to(device)
             y = y.to(device)
             with torch.no_grad():
-                # Map input images to latent space + normalize latents:
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
             model_kwargs = dict(y=y)
-            loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
-            loss = loss_dict["loss"].mean()
+            
             opt.zero_grad()
-            loss.backward()
-            opt.step()
+            with get_autocast(amp_enabled, amp_dtype):
+                loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
+                loss = loss_dict["loss"].mean()
+            
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                if args.grad_clip > 0:
+                    scaler.unscale_(opt)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss.backward()
+                if args.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+                opt.step()
             update_ema(ema, model.module)
 
             # Log loss values:
@@ -215,16 +237,13 @@ def main(args):
             log_steps += 1
             train_steps += 1
             if train_steps % args.log_every == 0:
-                # Measure training speed:
-                torch.cuda.synchronize()
+                synchronize()
                 end_time = time()
                 steps_per_sec = log_steps / (end_time - start_time)
-                # Reduce loss history over all processes:
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / dist.get_world_size()
                 logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
-                # Reset monitoring variables:
                 running_loss = 0
                 log_steps = 0
                 start_time = time()
@@ -261,9 +280,11 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=1400)
     parser.add_argument("--global-batch-size", type=int, default=256)
     parser.add_argument("--global-seed", type=int, default=0)
-    parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
+    parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
+    parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping value (0 to disable)")
+    add_device_args(parser)
     args = parser.parse_args()
     main(args)
