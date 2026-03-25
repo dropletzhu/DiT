@@ -43,7 +43,10 @@ def main(args):
     model.load_state_dict(state_dict)
     model.eval()
     diffusion = create_diffusion(str(args.num_sampling_steps))
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    if args.vae_path:
+        vae = AutoencoderKL.from_pretrained(args.vae_path).to(device)
+    else:
+        vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
 
     class_labels = [207, 360, 387, 974, 88, 979, 417, 279]
     n = len(class_labels)
@@ -77,6 +80,8 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a DiT checkpoint (default: auto-download a pre-trained DiT-XL/2 model).")
+    parser.add_argument("--vae-path", type=str, default=None,
+                        help="Optional path to a local VAE model (default: download from HuggingFace).")
     add_device_args(parser)
     args = parser.parse_args()
     main(args)
