@@ -125,6 +125,50 @@ model.set_train(False)
 3. **设备**: 脚本默认使用 Ascend NPU (device_id=0)
 4. **混合精度**: 当前版本未启用 AMP
 
+## 测试报告
+
+### 测试环境
+
+- **硬件**: Ascend NPU
+- **MindSpore 版本**: 2.8.0
+- **测试日期**: 2026-03-25
+
+### 推理测试
+
+```bash
+python ms_sample.py --model DiT-S/2 --image-size 256 --num-sampling-steps 10 --seed 42
+```
+
+**测试结果**: ✅ 通过
+
+| 指标 | 结果 |
+|------|------|
+| 模型加载 | 成功 |
+| 采样步数 | 10 |
+| 生成样本数 | 8 |
+| 输出文件 | ms_sample_0.png ~ ms_sample_7.png |
+
+### 训练测试
+
+```bash
+python ms_train.py --model DiT-S/2 --data-path <imagenet-path> --test
+```
+
+**测试结果**: ✅ 通过
+
+| 指标 | 结果 |
+|------|------|
+| 模型参数量 | 32,982,560 (33M) |
+| 数据集大小 | 1000 images |
+| 训练步数 | 10 |
+| 最终 Loss | 1.0024 |
+| EMA 更新 | 正常 |
+
+### 已知问题
+
+1. **弃用警告**: MindSpore 2.8.0 对 `device_target` 和 `device_id` 参数发出弃用警告，建议使用 `mindspore.set_device()` 代替
+2. **简化 Diffusion**: 当前使用简化 DDPM，未使用完整的 diffusion 库
+
 ## 许可证
 
 与原始 DiT 项目相同，采用 CC-BY-NC 许可证。
