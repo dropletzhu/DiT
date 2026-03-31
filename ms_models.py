@@ -234,13 +234,12 @@ class DiT(nn.Cell):
         half_idx = x.shape[0] // 2
         combined = ops.Concat(0)([x[:half_idx], x[:half_idx]])
         model_out = self.forward(combined, t, y)
-        eps = model_out[:, :3]
-        rest = model_out[:, 3:]
+        # Use all 4 channels for latent
+        eps = model_out[:, :4]
         cond_eps = eps[:half_idx]
         uncond_eps = eps[half_idx:]
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
-        eps = ops.Concat(0)([half_eps, half_eps])
-        return ops.Concat(1)([eps, rest])
+        return half_eps
 
 
 #################################################################################
