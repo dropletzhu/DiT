@@ -1,0 +1,43 @@
+# Model weights and checkpoints
+*.pt
+*.ckpt
+*.onnx
+!mindspore/vae_utils.py
+
+# Pretrained models
+pretrained_models/
+
+# MindSpore outputs
+ms_results/
+rank_0/
+
+# Test data
+test_data/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+
+# Diffusion cache
+diffusion/__pycache__/
+utils/__pycache__/
+
+# NPU kernel meta
+kernel_meta/
+
+# Generated samples
+*.png
+pt_*.pt
+pt_*.npy
+
+# Results
+results/
+visuals/
+
+# Session files
+session-*.md
+
+# Fusion result
+fusion_result.json
