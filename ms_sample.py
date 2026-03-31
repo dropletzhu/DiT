@@ -200,6 +200,8 @@ def main(args):
     class_labels = [207, 360, 387, 974, 88, 979, 417, 279]
     n = len(class_labels)
     
+    # Use same random seed as PyTorch version
+    ms.set_seed(args.seed)
     z = ops.StandardNormal()((n * 2, 4, latent_size, latent_size)).astype(ms.float32)
     y = ms.Tensor(class_labels + [1000] * n, dtype=ms.int32)
     
@@ -213,12 +215,14 @@ def main(args):
         print("Decoding latents with VAE...")
         samples_np = samples.asnumpy()
         samples_np = samples_np / 0.18215
-        samples = vae.decode(samples_np)
+        decoded = vae.decode(samples_np)
+        # VAE output is already image data in range [-1, 1], no normalization needed
+        decoded = np.clip(decoded, -1, 1)
+        decoded = (decoded + 1) / 2  # Convert to [0, 1]
+        decoded = (decoded * 255).astype(np.uint8)
+        samples_np = decoded
     else:
         samples_np = samples.asnumpy() / 0.18215
-    
-    samples_np = (samples_np - samples_np.min()) / (samples_np.max() - samples_np.min() + 1e-8)
-    samples_np = (samples_np * 255).astype(np.uint8)
     
     C, H, W = samples_np.shape[1:]
     
