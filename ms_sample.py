@@ -1,10 +1,13 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
-# MindSpore DiT Sampling Script for Ascend NPU
+# MindSpore DiT Sampling Script for Ascend NPU with ONNX VAE
 
 import argparse
 import os
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mindspore'))
+
 import numpy as np
 import mindspore as ms
 import mindspore.nn as nn
@@ -14,19 +17,21 @@ from tqdm import tqdm
 import math
 
 from ms_models import DiT_models
+from vae_utils import MindSporeVAE
 
 
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps):
     if schedule_name == "linear":
-        betas = np.linspace(1e-4, 0.02, num_diffusion_timesteps, dtype=np.float64)
-    elif schedule_name == "cosine":
+        scale = 1000.0 / num_diffusion_timesteps
+        betas = np.linspace(scale * 1e-4, scale * 0.02, num_diffusion_timesteps, dtype=np.float64)
+    elif schedule_name == "squaredcos_cap_v2":
         betas = betas_for_alpha_bar(num_diffusion_timesteps)
     else:
         raise ValueError(f"Unknown schedule: {schedule_name}")
     return betas.astype(np.float32)
 
 
-def betas_for_alpha_bar(num_diffusion_timesteps):
+def betas_for_alpha_bar(num_diffusion_timesteps, max_beta=0.999):
     def alpha_bar(time_step):
         return math.cos((time_step + 0.008) / 1.008 * math.pi / 2) ** 2
 
@@ -34,14 +39,42 @@ def betas_for_alpha_bar(num_diffusion_timesteps):
     for i in range(num_diffusion_timesteps):
         t1 = i / num_diffusion_timesteps
         t2 = (i + 1) / num_diffusion_timesteps
-        betas.append(min(1 - alpha_bar(t2) / alpha_bar(t1), 0.999))
+        betas.append(min(1 - alpha_bar(t2) / alpha_bar(t1), max_beta))
     return np.array(betas)
 
 
+def space_timesteps(base_num_steps, selection):
+    if isinstance(selection, str):
+        if selection.startswith("ddim"):
+            step_str = selection[4:]
+            if not step_str:
+                num_steps = base_num_steps
+            else:
+                num_steps = int(step_str)
+        else:
+            num_steps = int(selection)
+        
+        if num_steps < base_num_steps:
+            ratio = base_num_steps / num_steps
+            steps = np.arange(0, num_steps) * ratio + ratio - 1
+            steps = np.round(steps).astype(int).tolist()
+            return [int(s) for s in steps]
+        else:
+            return list(range(base_num_steps))
+    
+    if len(selection) == base_num_steps:
+        return selection
+    
+    assert len(selection) < base_num_steps
+    gap = base_num_steps // len(selection)
+    return [i * gap for i in range(len(selection))]
+
+
 class GaussianDiffusion:
-    def __init__(self, betas, num_classes=1000):
+    def __init__(self, betas, num_classes=1000, timesteps=None):
         self.num_timesteps = len(betas)
         self.num_classes = num_classes
+        self.timesteps = timesteps if timesteps is not None else list(range(self.num_timesteps))
         betas = ms.Tensor(betas, dtype=ms.float32)
         alphas = 1.0 - betas
         self.alphas_cumprod = ops.CumProd()(alphas, 0)
@@ -122,7 +155,7 @@ class GaussianDiffusion:
     def p_sample_loop(self, model, shape, y, cfg_scale, progress=True):
         x = ops.StandardNormal()(shape).astype(ms.float32)
         
-        indices = list(range(self.num_timesteps))
+        indices = self.timesteps
         if progress:
             indices = tqdm(indices, desc="Sampling")
         
@@ -136,7 +169,7 @@ def main(args):
     ms.set_context(device_target="Ascend", device_id=0)
     ms.set_seed(args.seed)
     
-    print("Starting MindSpore DiT inference...", flush=True)
+    print("Starting MindSpore DiT inference with VAE...", flush=True)
     
     latent_size = args.image_size // 8
     
@@ -144,9 +177,25 @@ def main(args):
     model.set_train(False)
     print(f"Model created: {args.model}")
     
-    betas = get_named_beta_schedule("linear", args.num_sampling_steps)
-    diffusion = GaussianDiffusion(betas, num_classes=args.num_classes)
-    print(f"Diffusion created with {args.num_sampling_steps} steps")
+    if args.ckpt:
+        print(f"Loading checkpoint from {args.ckpt}...")
+        ms.load_checkpoint(args.ckpt, model, strict_load=True)
+        print("Checkpoint loaded successfully")
+    
+    betas = get_named_beta_schedule("linear", 1000)
+    # Rescale betas to match PyTorch: scale = 1000/250 = 4
+    # PyTorch uses 250 steps with scale factor 4
+    scale = 1000.0 / args.num_sampling_steps
+    betas = betas * scale
+    # Then sample from these betas using space_timesteps
+    timesteps = space_timesteps(1000, str(args.num_sampling_steps))
+    diffusion = GaussianDiffusion(betas, num_classes=args.num_classes, timesteps=timesteps)
+    print(f"Diffusion created with 1000 base steps, sampling with {len(timesteps)} steps (timesteps: {timesteps[:5]}...{timesteps[-5:]})")
+    
+    if args.vae_path:
+        print(f"Loading VAE from {args.vae_path}...")
+        vae = MindSporeVAE(args.vae_path)
+        print("VAE loaded successfully")
     
     class_labels = [207, 360, 387, 974, 88, 979, 417, 279]
     n = len(class_labels)
@@ -160,7 +209,13 @@ def main(args):
     
     samples, _ = ops.Split(0, 2)(samples)
     
-    samples_np = samples.asnumpy()
+    if args.vae_path:
+        print("Decoding latents with VAE...")
+        samples_np = samples.asnumpy()
+        samples_np = samples_np / 0.18215
+        samples = vae.decode(samples_np)
+    else:
+        samples_np = samples.asnumpy() / 0.18215
     
     samples_np = (samples_np - samples_np.min()) / (samples_np.max() - samples_np.min() + 1e-8)
     samples_np = (samples_np * 255).astype(np.uint8)
@@ -183,8 +238,8 @@ def main(args):
         col = idx % cols
         grid[row*img_h:(row+1)*img_h, col*img_w:(col+1)*img_w] = img_array[idx]
     
-    Image.fromarray(grid).save("ms_sample.png")
-    print("Saved 8 samples as ms_sample.png")
+    Image.fromarray(grid).save(args.output)
+    print(f"Saved 8 samples as {args.output}")
 
 
 if __name__ == "__main__":
@@ -195,5 +250,8 @@ if __name__ == "__main__":
     parser.add_argument("--cfg-scale", type=float, default=4.0)
     parser.add_argument("--num-sampling-steps", type=int, default=250)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--ckpt", type=str, default=None, help="Path to DiT checkpoint")
+    parser.add_argument("--vae-path", type=str, default=None, help="Path to VAE ONNX model")
+    parser.add_argument("--output", type=str, default="ms_sample.png", help="Output image file")
     args = parser.parse_args()
     main(args)

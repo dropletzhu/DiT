@@ -267,5 +267,9 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt-every", type=int, default=100)
     parser.add_argument("--test", action="store_true", help="Test mode: run only a few steps")
     parser.add_argument("--max-steps", type=int, default=None, help="Maximum training steps")
+    
+    # Set default max_steps for testing if test mode
     args = parser.parse_args()
+    if args.test:
+        args.max_steps = args.max_steps or 100
     main(args)

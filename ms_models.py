@@ -72,6 +72,11 @@ class DiTBlock(nn.Cell):
         self.qkv = nn.Dense(hidden_size, 3 * hidden_size, has_bias=True)
         self.proj = nn.Dense(hidden_size, hidden_size, has_bias=True)
         self.norm2 = nn.LayerNorm((hidden_size,), epsilon=1e-6)
+        # Initialize LayerNorm gamma to ones, beta to zeros
+        self.norm1.gamma.set_data(ms.Tensor(np.ones(hidden_size, dtype=np.float32)))
+        self.norm1.beta.set_data(ms.Tensor(np.zeros(hidden_size, dtype=np.float32)))
+        self.norm2.gamma.set_data(ms.Tensor(np.ones(hidden_size, dtype=np.float32)))
+        self.norm2.beta.set_data(ms.Tensor(np.zeros(hidden_size, dtype=np.float32)))
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.mlp = nn.SequentialCell([
             nn.Dense(hidden_size, mlp_hidden_dim),
@@ -118,6 +123,9 @@ class FinalLayer(nn.Cell):
             nn.SiLU(),
             nn.Dense(hidden_size, 2 * hidden_size, has_bias=True)
         ])
+        # Initialize LayerNorm gamma to ones, beta to zeros
+        self.norm_final.gamma.set_data(ms.Tensor(np.ones(hidden_size, dtype=np.float32)))
+        self.norm_final.beta.set_data(ms.Tensor(np.zeros(hidden_size, dtype=np.float32)))
 
     def construct(self, x, c):
         shift, scale = ops.Split(-1, 2)(self.adaLN_modulation(c))

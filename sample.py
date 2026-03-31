@@ -45,6 +45,8 @@ def main(args):
     diffusion = create_diffusion(str(args.num_sampling_steps))
     if args.vae_path:
         vae = AutoencoderKL.from_pretrained(args.vae_path).to(device)
+    elif args.no_vae:
+        vae = None
     else:
         vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
 
