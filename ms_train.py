@@ -242,8 +242,8 @@ def main(args):
                 print(f"Saved checkpoint to {checkpoint_path}")
             
             # Test with limited iterations
-            if args.test and train_steps >= 10:
-                print("Test completed after 10 steps")
+            if args.max_steps is not None and train_steps >= args.max_steps:
+                print(f"Reached max_steps={args.max_steps}, stopping training...")
                 return
     
     if rank == 0:
@@ -266,5 +266,6 @@ if __name__ == "__main__":
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--ckpt-every", type=int, default=100)
     parser.add_argument("--test", action="store_true", help="Test mode: run only a few steps")
+    parser.add_argument("--max-steps", type=int, default=None, help="Maximum training steps")
     args = parser.parse_args()
     main(args)
