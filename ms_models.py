@@ -219,7 +219,8 @@ class DiT(nn.Cell):
     def construct(self, x, t, y):
         x = self.x_embedder(x) + self.pos_embed
         t = self.t_embedder(t)
-        y = self.y_embedder(y, self.training)
+        training = self.training if hasattr(self, 'training') else False
+        y = self.y_embedder(y, training)
         c = t + y
         for block in self.blocks:
             x = block(x, c)
@@ -239,7 +240,8 @@ class DiT(nn.Cell):
         cond_eps = eps[:half_idx]
         uncond_eps = eps[half_idx:]
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
-        return half_eps
+        # Duplicate to match original batch size
+        return ops.Concat(0)([half_eps, half_eps])
 
 
 #################################################################################

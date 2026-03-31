@@ -95,9 +95,18 @@ class GaussianDiffusion:
         self.posterior_mean_coef2 = (1 - self.alphas_cumprod_prev) * ops.Sqrt()(alphas / self.alphas_cumprod)
 
     def _extract(self, a, t, x_shape):
+        # a is 1D tensor of alphas
+        # t is 1D tensor of timesteps [batch_size]
         batch_size = t.shape[0]
-        out = ops.GatherD()(a.expand_dims(0), 0, t.reshape(-1, 1)).reshape(batch_size, *([1] * (len(x_shape) - 1)))
-        return out
+        # Convert t to numpy for indexing
+        t_np = t.asnumpy() if hasattr(t, 'asnumpy') else t
+        indices = t_np.astype(int)
+        # Get values from a using indexing
+        result = a.asnumpy()[indices]
+        # Convert back to tensor and reshape to x_shape
+        result = ms.Tensor(result, dtype=ms.float32)
+        # Reshape to [batch, 1, 1, 1] for broadcasting
+        return result.reshape(batch_size, 1, 1, 1)
 
     def q_sample(self, x_start, t, noise=None):
         if noise is None:
@@ -124,11 +133,8 @@ class GaussianDiffusion:
         )
 
     def p_mean_variance(self, model, x, t, y, cfg_scale, clip_denoised=True):
-        half = x.shape[0] // 2
-        
-        combined = ops.Concat(0)([x[:half], x[:half]])
-        
-        model_output = model(combined, t, y, cfg_scale)
+        # model here is already forward_with_cfg
+        model_output = model(x, t, y, cfg_scale)
         
         x_recon = self.predict_start_from_noise(x, t, model_output[:, :4])
         
@@ -143,6 +149,7 @@ class GaussianDiffusion:
         batch_size = x.shape[0]
         t_tensor = ms.Tensor([t] * batch_size, dtype=ms.int32)
         
+        # Pass y directly to p_mean_variance, which will handle CFG
         model_mean, _, model_log_variance = self.p_mean_variance(model, x, t_tensor, y, cfg_scale, clip_denoised)
         
         noise = ops.StandardNormal()(x.shape).astype(ms.float32)
@@ -153,14 +160,20 @@ class GaussianDiffusion:
             return model_mean
 
     def p_sample_loop(self, model, shape, y, cfg_scale, progress=True):
-        x = ops.StandardNormal()(shape).astype(ms.float32)
+        # y is the original class labels
+        # forward_with_cfg expects doubled input, so we create doubled latent
+        half = shape[0]
+        x = ops.StandardNormal()((half * 2, 4, shape[1], shape[2])).astype(ms.float32)
+        
+        # Double y for CFG (original labels + null labels)
+        y_doubled = ops.Concat(0)([y, ms.Tensor([1000] * half, dtype=ms.int32)])
         
         indices = self.timesteps
         if progress:
             indices = tqdm(indices, desc="Sampling")
         
         for i in indices:
-            x = self.p_sample(model, x, i, y, cfg_scale, clip_denoised=True)
+            x = self.p_sample(model, x, i, y_doubled, cfg_scale, clip_denoised=True)
         
         return x
 
@@ -202,9 +215,11 @@ def main(args):
     
     # Use same random seed as PyTorch version
     ms.set_seed(args.seed)
+    # Create latent for n*2 samples (for CFG)
     z = ops.StandardNormal()((n * 2, 4, latent_size, latent_size)).astype(ms.float32)
     y = ms.Tensor(class_labels + [1000] * n, dtype=ms.int32)
     
+    # Call p_sample_loop with forward_with_cfg
     samples = diffusion.p_sample_loop(
         model.forward_with_cfg, z.shape, y, args.cfg_scale, progress=True
     )
