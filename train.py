@@ -248,6 +248,9 @@ def main(args):
             running_loss += loss.item()
             log_steps += 1
             train_steps += 1
+            if args.max_steps is not None and train_steps >= args.max_steps:
+                logger.info(f"Reached max_steps={args.max_steps}, stopping training...")
+                break
             if train_steps % args.log_every == 0:
                 synchronize()
                 end_time = time()
@@ -299,6 +302,7 @@ if __name__ == "__main__":
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping value (0 to disable)")
+    parser.add_argument("--max-steps", type=int, default=None, help="Maximum training steps (default: unlimited)")
     add_device_args(parser)
     args = parser.parse_args()
     if args.device != "auto":
