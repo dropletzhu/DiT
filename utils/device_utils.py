@@ -1,139 +1,70 @@
-# device_utils.py - Device abstraction for GPU and NPU support
+# Device utilities for GPU and NPU support
+
 import torch
-import argparse
-from typing import Optional
-
-_device_override = None
-
-def set_device_override(device_type):
-    """Override device detection (for CLI args)"""
-    global _device_override
-    _device_override = device_type
-
-def get_device_type():
-    """Detect and return device type: 'npu', 'cuda', 'cpu'"""
-    global _device_override
-    if _device_override is not None:
-        return _device_override
-    if hasattr(torch, 'npu') and torch.npu.is_available():
-        return 'npu'
-    elif torch.cuda.is_available():
-        return 'cuda'
-    return 'cpu'
-
 
 def get_device():
-    """Return torch.device object"""
-    return torch.device(get_device_type())
-
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    elif hasattr(torch, "npu") and torch.npu.is_available():
+        return torch.device("npu")
+    return torch.device("cpu")
 
 def get_device_str():
-    """Return device string for tensor creation"""
-    return get_device_type()
+    if torch.cuda.is_available():
+        return "cuda"
+    elif hasattr(torch, "npu") and torch.npu.is_available():
+        return "npu"
+    return "cpu"
 
+def get_device_type(device):
+    return str(device).split(":")[0] if ":" in str(device) else str(device)
 
 def get_device_count():
-    """Return number of available devices"""
-    dev_type = get_device_type()
-    if dev_type == 'npu':
-        return torch.npu.device_count()
-    elif dev_type == 'cuda':
+    if torch.cuda.is_available():
         return torch.cuda.device_count()
+    elif hasattr(torch, "npu") and torch.npu.is_available():
+        return torch.npu.device_count()
     return 1
 
-
-def set_device(device_id: int):
-    """Set current device"""
-    dev_type = get_device_type()
-    if dev_type == 'npu':
-        torch.npu.set_device(device_id)
-    elif dev_type == 'cuda':
+def set_device(device_id):
+    if torch.cuda.is_available():
         torch.cuda.set_device(device_id)
+    elif hasattr(torch, "npu") and torch.npu.is_available():
+        torch.npu.set_device(device_id)
 
+def set_device_override(device_str):
+    pass
 
 def synchronize():
-    """Synchronize device"""
-    dev_type = get_device_type()
-    if dev_type == 'npu':
-        torch.npu.synchronize()
-    elif dev_type == 'cuda':
-        torch.cuda.synchronize()
-
-
-def enable_tf32(enabled: bool = True):
-    """Enable TF32 precision (only effective for CUDA, ignored for NPU)"""
     if torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = enabled
-        torch.backends.cudnn.allow_tf32 = enabled
+        torch.cuda.synchronize()
+    elif hasattr(torch, "npu") and torch.npu.is_available():
+        torch.npu.synchronize()
 
+def enable_tf32(enabled=True):
+    if hasattr(torch, "backends") and hasattr(torch.backends, "cuda"):
+        torch.backends.cuda.matmul.allow_tf32 = enabled
 
 def get_distributed_backend():
-    """Return distributed backend: 'hccl' (NPU) / 'nccl' (CUDA) / 'gloo' (CPU)"""
-    device_type = get_device_type()
-    if device_type == 'npu':
-        return 'hccl'
-    elif device_type == 'cuda':
-        return 'nccl'
-    else:
-        return 'gloo'
+    return "nccl"
 
+def get_autocast(enabled, dtype):
+    return torch.cuda.amp.autocast(enabled=enabled, dtype=dtype) if enabled else None
 
-def get_autocast(enabled: bool = True, dtype=torch.float16):
-    """Return autocast context manager"""
-    dev_type = get_device_type()
-    if dev_type in ('npu', 'cuda') and enabled:
-        return torch.amp.autocast(device_type=dev_type, dtype=dtype)
-    return torch.amp.autocast(device_type='cpu', dtype=torch.float32, enabled=False)
-
-
-def get_amp_scaler(enabled: bool = True):
-    """Return GradScaler (only for NPU/CUDA)"""
-    dev_type = get_device_type()
-    if dev_type in ('npu', 'cuda') and enabled:
-        return torch.amp.GradScaler(dev_type)
-    return None
-
+def get_amp_scaler():
+    return torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
 
 def is_npu():
-    """Check if device is NPU"""
-    return get_device_type() == 'npu'
-
+    return hasattr(torch, "npu") and torch.npu.is_available()
 
 def is_cuda():
-    """Check if device is CUDA"""
-    return get_device_type() == 'cuda'
-
+    return torch.cuda.is_available()
 
 def is_available():
-    """Check if any accelerator is available"""
-    return get_device_type() != 'cpu'
+    return torch.cuda.is_available() or (hasattr(torch, "npu") and torch.npu.is_available())
 
-
-def add_device_args(parser: argparse.ArgumentParser):
-    """Add device-related arguments to argparse parser"""
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="auto",
-        choices=["auto", "npu", "cuda", "cpu"],
-        help="Device to use: auto (detect), npu, cuda, or cpu (default: auto)"
-    )
-    parser.add_argument(
-        "--amp",
-        action="store_true",
-        default=True,
-        help="Enable automatic mixed precision (default: True)"
-    )
-    parser.add_argument(
-        "--no-amp",
-        action="store_true",
-        help="Disable automatic mixed precision"
-    )
-    parser.add_argument(
-        "--dtype",
-        type=str,
-        default="fp16",
-        choices=["fp16", "bf16"],
-        help="AMP dtype: fp16 or bf16 (default: fp16)"
-    )
-    return parser
+def add_device_args(parser):
+    parser.add_argument("--device_id", type=int, default=0)
+    parser.add_argument("--amp", action="store_true", default=True)
+    parser.add_argument("--no_amp", action="store_true", default=False)
+    parser.add_argument("--dtype", type=str, default="bf16", choices=["bf16", "fp16"])

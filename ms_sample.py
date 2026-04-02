@@ -1,276 +1,256 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
-# MindSpore DiT Sampling Script for Ascend NPU with ONNX VAE
+# MindSpore DiT Inference Script for Ascend NPU
 
 import argparse
 import os
 import sys
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mindspore'))
+from pathlib import Path
 
 import numpy as np
 import mindspore as ms
 import mindspore.nn as nn
-from mindspore import ops
-from PIL import Image
-from tqdm import tqdm
-import math
+from mindspore import mint, ops
 
-from ms_models import DiT_models
-from vae_utils import MindSporeVAE
+sys.path.insert(0, str(Path(__file__).parent))
+
+from ms_models import DiT_models, DiT
+from diffusion import create_diffusion
+from mindone.diffusers import AutoencoderKL
+
+os.environ['ASCEND_SLOG_PRINT_TO_STDOUT'] = '0'
 
 
-def get_named_beta_schedule(schedule_name, num_diffusion_timesteps):
-    if schedule_name == "linear":
-        scale = 1000.0 / num_diffusion_timesteps
-        betas = np.linspace(scale * 1e-4, scale * 0.02, num_diffusion_timesteps, dtype=np.float64)
-    elif schedule_name == "squaredcos_cap_v2":
-        betas = betas_for_alpha_bar(num_diffusion_timesteps)
+class WrappedDiTModel(nn.Cell):
+    """Wrapper for DiT model to handle classifier-free guidance - matching PyTorch's forward_with_cfg"""
+    def __init__(self, model, cfg_scale=4.0):
+        super().__init__()
+        self.model = model
+        self.cfg_scale = cfg_scale
+    
+    def construct(self, x, t, y):
+        # When x has more samples than y, apply CFG
+        # x has shape [2*batch_size, 4, H, W] and y has shape [batch_size] 
+        if y.shape[0] * 2 == x.shape[0]:
+            half = y.shape[0]
+            x1 = x[:half]
+            x2 = x[half:]
+            combined = mint.cat([x1, x2], dim=0)
+            combined_y = mint.cat([y, y], dim=0)
+            
+            output = self.model(combined, t, combined_y)
+            
+            eps = output[:, :3, :, :]
+            rest = output[:, 3:, :, :]
+            
+            eps_uncond, eps_cond = eps[:half], eps[half:]
+            eps_cfg = eps_uncond + self.cfg_scale * (eps_cond - eps_uncond)
+            
+            return mint.cat([eps_cfg, rest], dim=1)
+        else:
+            # No CFG needed
+            output = self.model(x, t, y)
+            return output
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="DiT Image Generation Inference on NPU")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Path to MindSpore DiT checkpoint")
+    parser.add_argument("--model", type=str, default="DiT-XL/2", help="Model name")
+    parser.add_argument("--output_dir", type=str, default="./ms_output", help="Output directory")
+    parser.add_argument("--num_images", type=int, default=4, help="Number of images to generate")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size per generation")
+    parser.add_argument("--num_inference_steps", type=int, default=250, help="Number of denoising steps")
+    parser.add_argument("--cfg_scale", type=float, default=4.0, help="Classifier-free guidance scale")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--image_size", type=int, default=256, help="Output image size")
+    parser.add_argument("--vae_path", type=str, default=None, help="Path to VAE model")
+    parser.add_argument("--device_id", type=int, default=0, help="NPU device ID")
+    return parser.parse_args()
+
+
+def set_seed(seed: int):
+    ms.set_seed(seed)
+    np.random.seed(seed)
+
+
+def load_dit_model(checkpoint_path: str, model_name: str, image_size: int = 256) -> DiT:
+    """Load DiT model from MindSpore checkpoint."""
+    latent_size = image_size // 8
+    
+    model = DiT_models[model_name]()
+    
+    if os.path.isfile(checkpoint_path) and checkpoint_path.endswith('.ckpt'):
+        param_dict = ms.load_checkpoint(checkpoint_path)
+        not_load = ms.load_param_into_net(model, param_dict)
+        
+        if not_load:
+            print(f"Warning: {len(not_load)} parameters not loaded")
+            for name in not_load[:5]:
+                print(f"  Not loaded: {name}")
+        print(f"Loaded checkpoint from {checkpoint_path}")
     else:
-        raise ValueError(f"Unknown schedule: {schedule_name}")
-    return betas.astype(np.float32)
+        print("Using random weights (no checkpoint loaded)")
+
+    model.set_train(False)
+    return model
 
 
-def betas_for_alpha_bar(num_diffusion_timesteps, max_beta=0.999):
-    def alpha_bar(time_step):
-        return math.cos((time_step + 0.008) / 1.008 * math.pi / 2) ** 2
-
-    betas = []
-    for i in range(num_diffusion_timesteps):
-        t1 = i / num_diffusion_timesteps
-        t2 = (i + 1) / num_diffusion_timesteps
-        betas.append(min(1 - alpha_bar(t2) / alpha_bar(t1), max_beta))
-    return np.array(betas)
-
-
-def space_timesteps(base_num_steps, selection):
-    if isinstance(selection, str):
-        if selection.startswith("ddim"):
-            step_str = selection[4:]
-            if not step_str:
-                num_steps = base_num_steps
-            else:
-                num_steps = int(step_str)
-        else:
-            num_steps = int(selection)
-        
-        if num_steps < base_num_steps:
-            ratio = base_num_steps / num_steps
-            steps = np.arange(0, num_steps) * ratio + ratio - 1
-            steps = np.round(steps).astype(int).tolist()
-            return [int(s) for s in steps]
-        else:
-            return list(range(base_num_steps))
+def generate_images(
+    model: DiT,
+    vae: AutoencoderKL,
+    diffusion,
+    class_labels: list,
+    latent_size: int,
+    num_inference_steps: int = 250,
+    guidance_scale: float = 4.0,
+    seed: int = 42,
+) -> np.ndarray:
+    """Generate images using DDIM sampling matching PyTorch sample.py logic."""
+    import numpy as onp
     
-    if len(selection) == base_num_steps:
-        return selection
+    batch_size = len(class_labels)
     
-    assert len(selection) < base_num_steps
-    gap = base_num_steps // len(selection)
-    return [i * gap for i in range(len(selection))]
-
-
-class GaussianDiffusion:
-    def __init__(self, betas, num_classes=1000, timesteps=None):
-        self.num_timesteps = len(betas)
-        self.num_classes = num_classes
-        self.timesteps = timesteps if timesteps is not None else list(range(self.num_timesteps))
-        betas = ms.Tensor(betas, dtype=ms.float32)
-        alphas = 1.0 - betas
-        self.alphas_cumprod = ops.CumProd()(alphas, 0)
+    ms.set_seed(seed)
+    latents = mint.randn((batch_size, 4, latent_size, latent_size), dtype=ms.float32)
+    
+    class_labels_tensor = ms.Tensor(class_labels, dtype=ms.int32)
+    class_null = ms.Tensor([1000] * batch_size, dtype=ms.int32)
+    
+    timesteps = sorted(diffusion.use_timesteps, reverse=True)
+    alphas_cumprod = diffusion.alphas_cumprod
+    alphas_cumprod_prev = diffusion.alphas_cumprod_prev
+    
+    # Pre-broadcast t_tensor
+    t_tensor_base = ms.Tensor([0], dtype=ms.int32)
+    
+    for i, t in enumerate(timesteps):
+        # Create timestep tensor with proper shape
+        t_tensor = ms.Tensor([t], dtype=ms.int32)
         
-        self.betas = betas
-        self.alphas_cumprod_prev = ops.Concat(0)(
-            [ms.Tensor([1.0], dtype=ms.float32), self.alphas_cumprod[:-1]]
+        # CFG: duplicate latent and labels
+        latent_model_input = mint.cat([latents, latents], dim=0)
+        class_labels_input = mint.cat([class_labels_tensor, class_null], dim=0)
+        
+        # Create properly shaped timestep
+        t_expanded = t_tensor.reshape(1)
+        t_expanded = t_expanded.broadcast_to((latent_model_input.shape[0],))
+        
+        # Run model
+        noise_pred = model(latent_model_input, t_expanded, class_labels_input)
+        
+        idx = diffusion.timestep_map.index(t) if t in diffusion.timestep_map else i
+        alpha_bar = alphas_cumprod[idx]
+        alpha_bar_prev = alphas_cumprod_prev[idx]
+        
+        sqrt_alpha_bar = onp.sqrt(alpha_bar)
+        sqrt_1_alpha_bar = onp.sqrt(1 - alpha_bar)
+        sqrt_alpha_bar_prev = onp.sqrt(alpha_bar_prev)
+        sqrt_1_alpha_bar_prev = onp.sqrt(1 - alpha_bar_prev)
+        
+        # Extract eps from noise_pred and apply CFG (matching PyTorch's forward_with_cfg)
+        eps_full = noise_pred[:, :3, :, :]
+        rest = noise_pred[:, 3:, :, :]
+        
+        eps_uncond, eps_cond = eps_full[:batch_size], eps_full[batch_size:]
+        eps_cfg = eps_uncond + guidance_scale * (eps_cond - eps_uncond)
+        
+        # Compute pred_xstart
+        pred_xstart = (latents - mint.mul(mint.Tensor(sqrt_1_alpha_bar, dtype=ms.float32), eps_cfg)) / mint.Tensor(sqrt_alpha_bar, dtype=ms.float32)
+        pred_xstart = mint.clip(pred_xstart, -1, 1)
+        
+        # Compute mean prediction
+        mean_pred = (
+            mint.mul(mint.Tensor(sqrt_alpha_bar_prev, dtype=ms.float32), pred_xstart)
+            + mint.mul(mint.Tensor(sqrt_1_alpha_bar_prev, dtype=ms.float32), (latents - mint.mul(mint.Tensor(sqrt_alpha_bar, dtype=ms.float32), pred_xstart)) / mint.Tensor(sqrt_1_alpha_bar, dtype=ms.float32))
         )
-        self.sqrt_recip_alphas_cumprod = ops.Sqrt()(1.0 / self.alphas_cumprod)
-        self.sqrt_recipm1_alphas_cumprod = ops.Sqrt()(1.0 / self.alphas_cumprod - 1)
         
-        self.posterior_variance = betas * (self.alphas_cumprod_prev / self.alphas_cumprod)
-        self.posterior_variance = ops.Concat(0)(
-            [ms.Tensor([0.0], dtype=ms.float32), self.posterior_variance[1:]]
-        )
-        self.posterior_log_variance_clipped = ops.Log()(ops.Maximum()(self.posterior_variance, ms.Tensor(1e-20, dtype=ms.float32)))
-        self.posterior_mean_coef1 = betas * ops.Sqrt()(self.alphas_cumprod_prev / self.alphas_cumprod)
-        self.posterior_mean_coef2 = (1 - self.alphas_cumprod_prev) * ops.Sqrt()(alphas / self.alphas_cumprod)
-
-    def _extract(self, a, t, x_shape):
-        # a is 1D tensor of alphas
-        # t is 1D tensor of timesteps [batch_size]
-        batch_size = t.shape[0]
-        # Convert t to numpy for indexing
-        t_np = t.asnumpy() if hasattr(t, 'asnumpy') else t
-        indices = t_np.astype(int)
-        # Get values from a using indexing
-        result = a.asnumpy()[indices]
-        # Convert back to tensor and reshape to x_shape
-        result = ms.Tensor(result, dtype=ms.float32)
-        # Reshape to [batch, 1, 1, 1] for broadcasting
-        return result.reshape(batch_size, 1, 1, 1)
-
-    def q_sample(self, x_start, t, noise=None):
-        if noise is None:
-            noise = ops.StandardNormal()(x_start.shape).astype(ms.float32)
-        
-        sqrt_alphas_cumprod_t = self._extract(self.sqrt_recip_alphas_cumprod, t, x_start.shape)
-        sqrt_recipm1_alphas_cumprod_t = self._extract(self.sqrt_recipm1_alphas_cumprod, t, x_start.shape)
-        
-        return sqrt_alphas_cumprod_t * x_start + sqrt_recipm1_alphas_cumprod_t * noise
-
-    def q_posterior_mean_variance(self, x_start, x_t, t):
-        posterior_mean = (
-            self._extract(self.posterior_mean_coef1, t, x_t.shape) * x_start +
-            self._extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
-        )
-        posterior_variance = self._extract(self.posterior_variance, t, x_t.shape)
-        posterior_log_variance_clipped = self._extract(self.posterior_log_variance_clipped, t, x_t.shape)
-        return posterior_mean, posterior_variance, posterior_log_variance_clipped
-
-    def predict_start_from_noise(self, x_t, t, noise):
-        return (
-            self._extract(self.sqrt_recip_alphas_cumprod, t, x_t.shape) * x_t -
-            self._extract(self.sqrt_recipm1_alphas_cumprod, t, x_t.shape) * noise
-        )
-
-    def p_mean_variance(self, model, x, t, y, cfg_scale, clip_denoised=True):
-        # model here is already forward_with_cfg
-        model_output = model(x, t, y, cfg_scale)
-        
-        x_recon = self.predict_start_from_noise(x, t, model_output[:, :4])
-        
-        if clip_denoised:
-            x_recon = ops.clip_by_value(x_recon, -1.0, 1.0)
-        
-        model_mean, posterior_variance, model_log_variance = self.q_posterior_mean_variance(x_recon, x, t)
-        
-        return model_mean, posterior_variance, model_log_variance
-
-    def p_sample(self, model, x, t, y, cfg_scale, clip_denoised=True):
-        batch_size = x.shape[0]
-        t_tensor = ms.Tensor([t] * batch_size, dtype=ms.int32)
-        
-        # Pass y directly to p_mean_variance, which will handle CFG
-        model_mean, _, model_log_variance = self.p_mean_variance(model, x, t_tensor, y, cfg_scale, clip_denoised)
-        
-        noise = ops.StandardNormal()(x.shape).astype(ms.float32)
-        
-        if t > 0:
-            return model_mean + ops.Exp()(0.5 * model_log_variance) * noise
+        if i < len(timesteps) - 1:
+            latents = mean_pred + mint.randn_like(latents) * 0.0
         else:
-            return model_mean
-
-    def p_sample_loop(self, model, shape, y, cfg_scale, progress=True):
-        # y is the original class labels
-        # forward_with_cfg expects doubled input, so we create doubled latent
-        half = shape[0]
-        x = ops.StandardNormal()((half * 2, 4, shape[1], shape[2])).astype(ms.float32)
-        
-        # Double y for CFG (original labels + null labels)
-        y_doubled = ops.Concat(0)([y, ms.Tensor([1000] * half, dtype=ms.int32)])
-        
-        indices = self.timesteps
-        if progress:
-            indices = tqdm(indices, desc="Sampling")
-        
-        for i in indices:
-            x = self.p_sample(model, x, i, y_doubled, cfg_scale, clip_denoised=True)
-        
-        return x
+            latents = mean_pred
+    
+    latents = 1 / 0.18215 * latents
+    samples = vae.decode(latents)[0]
+    
+    samples = (samples / 2 + 0.5).clip(0, 1)
+    samples = samples.permute(0, 2, 3, 1).float().asnumpy()
+    
+    return samples
 
 
 def main(args):
-    ms.set_context(device_target="Ascend", device_id=0)
-    ms.set_seed(args.seed)
+    ms.set_context(device_target="Ascend", device_id=args.device_id, mode=ms.PYNATIVE_MODE)
     
-    print("Starting MindSpore DiT inference with VAE...", flush=True)
+    os.makedirs(args.output_dir, exist_ok=True)
     
-    latent_size = args.image_size // 8
+    print(f"Starting DiT inference on NPU (device_id={args.device_id})")
+    print(f"Checkpoint: {args.checkpoint}")
+    print(f"Model: {args.model}")
+    print(f"Image size: {args.image_size}")
     
-    model = DiT_models[args.model](input_size=latent_size, num_classes=args.num_classes)
-    model.set_train(False)
-    print(f"Model created: {args.model}")
+    set_seed(args.seed)
     
-    if args.ckpt:
-        print(f"Loading checkpoint from {args.ckpt}...")
-        ms.load_checkpoint(args.ckpt, model, strict_load=True)
-        print("Checkpoint loaded successfully")
+    sample_size = args.image_size // 8
     
-    betas = get_named_beta_schedule("linear", 1000)
-    # Rescale betas to match PyTorch: scale = 1000/250 = 4
-    # PyTorch uses 250 steps with scale factor 4
-    scale = 1000.0 / args.num_sampling_steps
-    betas = betas * scale
-    # Then sample from these betas using space_timesteps
-    timesteps = space_timesteps(1000, str(args.num_sampling_steps))
-    diffusion = GaussianDiffusion(betas, num_classes=args.num_classes, timesteps=timesteps)
-    print(f"Diffusion created with 1000 base steps, sampling with {len(timesteps)} steps (timesteps: {timesteps[:5]}...{timesteps[-5:]})")
+    print("Loading DiT model...")
+    model = load_dit_model(args.checkpoint, args.model, args.image_size)
+    print(f"Model loaded, sample_size: {sample_size}")
     
+    print("Loading VAE...")
     if args.vae_path:
-        print(f"Loading VAE from {args.vae_path}...")
-        vae = MindSporeVAE(args.vae_path)
-        print("VAE loaded successfully")
-    
-    class_labels = [207, 360, 387, 974, 88, 979, 417, 279]
-    n = len(class_labels)
-    
-    # Use same random seed as PyTorch version
-    ms.set_seed(args.seed)
-    # Create latent for n*2 samples (for CFG)
-    z = ops.StandardNormal()((n * 2, 4, latent_size, latent_size)).astype(ms.float32)
-    y = ms.Tensor(class_labels + [1000] * n, dtype=ms.int32)
-    
-    # Call p_sample_loop with forward_with_cfg
-    samples = diffusion.p_sample_loop(
-        model.forward_with_cfg, z.shape, y, args.cfg_scale, progress=True
-    )
-    
-    samples, _ = ops.Split(0, 2)(samples)
-    
-    if args.vae_path:
-        print("Decoding latents with VAE...")
-        samples_np = samples.asnumpy()
-        samples_np = samples_np / 0.18215
-        decoded = vae.decode(samples_np)
-        # VAE output is already image data in range [-1, 1], no normalization needed
-        decoded = np.clip(decoded, -1, 1)
-        decoded = (decoded + 1) / 2  # Convert to [0, 1]
-        decoded = (decoded * 255).astype(np.uint8)
-        samples_np = decoded
+        vae = AutoencoderKL.from_pretrained(args.vae_path)
     else:
-        samples_np = samples.asnumpy() / 0.18215
+        vae = AutoencoderKL.from_pretrained("/home/ma-user/work/temp/sd-vae-ft-mse")
+    vae = vae.to(ms.float32)
+    vae.set_train(False)
+    print("VAE loaded")
     
-    C, H, W = samples_np.shape[1:]
+    print("Loading diffusion...")
+    diffusion = create_diffusion(str(args.num_inference_steps))
+    print(f"Diffusion loaded with {args.num_inference_steps} steps")
     
-    if C == 3:
-        img_array = samples_np.transpose(0, 2, 3, 1)
-    elif C == 4:
-        img_array = samples_np[:, :3].transpose(0, 2, 3, 1)
-    else:
-        img_array = samples_np.transpose(0, 2, 3, 1)
+    class_labels = [207, 360, 387, 974, 88, 979, 417, 279][:args.num_images]
+    if len(class_labels) < args.num_images:
+        class_labels = class_labels * (args.num_images // len(class_labels) + 1)
+    class_labels = class_labels[:args.num_images]
     
-    rows, cols = 2, 4
-    img_h, img_w = H, W
-    grid = np.zeros((img_h * rows, img_w * cols, 3), dtype=np.uint8)
+    print(f"Class labels: {class_labels}")
+    print(f"Generating {args.num_images} images...")
     
-    for idx in range(min(n, 8)):
-        row = idx // cols
-        col = idx % cols
-        grid[row*img_h:(row+1)*img_h, col*img_w:(col+1)*img_w] = img_array[idx]
+    all_images = []
+    num_batches = (args.num_images + args.batch_size - 1) // args.batch_size
     
-    Image.fromarray(grid).save(args.output)
-    print(f"Saved 8 samples as {args.output}")
+    for batch_idx in range(num_batches):
+        start_idx = batch_idx * args.batch_size
+        end_idx = min(start_idx + args.batch_size, args.num_images)
+        batch_labels = class_labels[start_idx:end_idx]
+        
+        print(f"Generating batch {batch_idx + 1}/{num_batches} with labels {batch_labels}")
+        
+        images = generate_images(
+            model=model,
+            vae=vae,
+            diffusion=diffusion,
+            class_labels=batch_labels,
+            latent_size=sample_size,
+            num_inference_steps=args.num_inference_steps,
+            guidance_scale=args.cfg_scale,
+            seed=args.seed + batch_idx,
+        )
+        
+        for i, img in enumerate(images):
+            img_path = os.path.join(args.output_dir, f"generated_{start_idx + i:04d}.png")
+            from PIL import Image
+            Image.fromarray((img * 255).astype(np.uint8)).save(img_path)
+        
+        all_images.extend(images)
+        print(f"Batch {batch_idx + 1} completed")
+    
+    print(f"Saved {len(all_images)} images to {args.output_dir}")
+    print("Done!")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
-    parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
-    parser.add_argument("--num-classes", type=int, default=1000)
-    parser.add_argument("--cfg-scale", type=float, default=4.0)
-    parser.add_argument("--num-sampling-steps", type=int, default=250)
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--ckpt", type=str, default=None, help="Path to DiT checkpoint")
-    parser.add_argument("--vae-path", type=str, default=None, help="Path to VAE ONNX model")
-    parser.add_argument("--output", type=str, default="ms_sample.png", help="Output image file")
-    args = parser.parse_args()
-    main(args)
+    main(parse_args())

@@ -84,6 +84,7 @@ if __name__ == "__main__":
                         help="Optional path to a DiT checkpoint (default: auto-download a pre-trained DiT-XL/2 model).")
     parser.add_argument("--vae-path", type=str, default=None,
                         help="Optional path to a local VAE model (default: download from HuggingFace).")
+    parser.add_argument("--no-vae", action="store_true", help="Skip VAE decoding")
     add_device_args(parser)
     args = parser.parse_args()
     main(args)

@@ -1,22 +1,36 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
 
-# MindSpore DiT Model Implementation for Ascend NPU
+# MindSpore DiT Model Implementation - matching PyTorch architecture exactly
 
 import mindspore as ms
 import mindspore.nn as nn
 import mindspore.ops as ops
 import numpy as np
-import math
+
+
+class LayerNormWithoutBias(nn.Cell):
+    """LayerNorm without bias - matching PyTorch's elementwise_affine=False behavior"""
+    def __init__(self, normalized_shape, epsilon=1e-6):
+        super().__init__()
+        if isinstance(normalized_shape, int):
+            normalized_shape = (normalized_shape,)
+        self.normalized_shape = normalized_shape
+        self.epsilon = epsilon
+        self.layer_norm = ops.LayerNorm(begin_norm_axis=1, begin_params_axis=1, epsilon=epsilon)
+
+    def construct(self, x):
+        x_shape = x.shape
+        param_shape = x_shape[1:]
+        gamma = ops.ones(param_shape, dtype=ms.float32)
+        beta = ops.zeros(param_shape, dtype=ms.float32)
+        output, _, _ = self.layer_norm(x, gamma, beta)
+        return output
 
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
-
-#################################################################################
-#               Embedding Layers for Timesteps and Class Labels                 #
-#################################################################################
 
 class TimestepEmbedder(nn.Cell):
     def __init__(self, hidden_size, frequency_embedding_size=256):
@@ -30,12 +44,13 @@ class TimestepEmbedder(nn.Cell):
 
     def timestep_embedding(self, t, dim, max_period=10000):
         half = dim // 2
-        freqs = np.exp(-math.log(max_period) * np.arange(0, half, dtype=np.float32) / half)
+        freqs = np.exp(-np.log(max_period) * np.arange(0, half, dtype=np.float32) / half)
         freqs = ms.Tensor(freqs, dtype=ms.float32)
-        args = t[:, None].astype(ms.float32) * freqs[None]
-        embedding = ops.Concat(-1)([ops.Cos()(args), ops.Sin()(args)])
+        t = t.astype(ms.float32)
+        args = t[:, None] * freqs[None]
+        embedding = ops.Concat(-1)((ops.Cos()(args), ops.Sin()(args)))
         if dim % 2:
-            embedding = ops.Concat(-1)([embedding, ops.ZerosLike()(embedding[:, :1])])
+            embedding = ops.Concat(-1)((embedding, ops.ZerosLike()(embedding[:, :1])))
         return embedding
 
     def construct(self, t):
@@ -57,10 +72,6 @@ class LabelEmbedder(nn.Cell):
         return embeddings
 
 
-#################################################################################
-#                                 Core DiT Model                                #
-#################################################################################
-
 class DiTBlock(nn.Cell):
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0):
         super().__init__()
@@ -68,15 +79,11 @@ class DiTBlock(nn.Cell):
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
         
-        self.norm1 = nn.LayerNorm((hidden_size,), epsilon=1e-6)
+        self.norm1 = LayerNormWithoutBias(hidden_size, epsilon=1e-6)
         self.qkv = nn.Dense(hidden_size, 3 * hidden_size, has_bias=True)
         self.proj = nn.Dense(hidden_size, hidden_size, has_bias=True)
-        self.norm2 = nn.LayerNorm((hidden_size,), epsilon=1e-6)
-        # Initialize LayerNorm gamma to ones, beta to zeros
-        self.norm1.gamma.set_data(ms.Tensor(np.ones(hidden_size, dtype=np.float32)))
-        self.norm1.beta.set_data(ms.Tensor(np.zeros(hidden_size, dtype=np.float32)))
-        self.norm2.gamma.set_data(ms.Tensor(np.ones(hidden_size, dtype=np.float32)))
-        self.norm2.beta.set_data(ms.Tensor(np.zeros(hidden_size, dtype=np.float32)))
+        self.norm2 = LayerNormWithoutBias(hidden_size, epsilon=1e-6)
+        
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         self.mlp = nn.SequentialCell([
             nn.Dense(hidden_size, mlp_hidden_dim),
@@ -117,15 +124,12 @@ class DiTBlock(nn.Cell):
 class FinalLayer(nn.Cell):
     def __init__(self, hidden_size, patch_size, out_channels):
         super().__init__()
-        self.norm_final = nn.LayerNorm((hidden_size,), epsilon=1e-6)
+        self.norm_final = LayerNormWithoutBias(hidden_size, epsilon=1e-6)
         self.linear = nn.Dense(hidden_size, patch_size * patch_size * out_channels, has_bias=True)
         self.adaLN_modulation = nn.SequentialCell([
             nn.SiLU(),
             nn.Dense(hidden_size, 2 * hidden_size, has_bias=True)
         ])
-        # Initialize LayerNorm gamma to ones, beta to zeros
-        self.norm_final.gamma.set_data(ms.Tensor(np.ones(hidden_size, dtype=np.float32)))
-        self.norm_final.beta.set_data(ms.Tensor(np.zeros(hidden_size, dtype=np.float32)))
 
     def construct(self, x, c):
         shift, scale = ops.Split(-1, 2)(self.adaLN_modulation(c))
@@ -187,16 +191,18 @@ class DiT(nn.Cell):
         self.initialize_weights()
 
     def initialize_weights(self):
-        for _, cell in self.cells_and_names():
-            if isinstance(cell, nn.Dense):
-                cell.weight.set_data(ms.numpy.rand(cell.weight.shape).astype(np.float32) * 0.02)
-                if cell.bias is not None:
-                    cell.bias.set_data(ms.numpy.zeros(cell.bias.shape, dtype=np.float32))
-            elif isinstance(cell, nn.Conv2d):
-                cell.weight.set_data(ms.numpy.rand(*cell.weight.shape).astype(np.float32) * 0.02)
-                if cell.bias is not None:
-                    cell.bias.set_data(ms.numpy.zeros(cell.bias.shape, dtype=np.float32))
-
+        def _basic_init(module):
+            if isinstance(module, nn.Dense):
+                module.weight.set_data(ms.numpy.randn(module.weight.shape).astype(np.float32) * 0.02)
+                if module.bias is not None:
+                    module.bias.set_data(ms.numpy.zeros(module.bias.shape, dtype=np.float32))
+            elif isinstance(module, nn.Conv2d):
+                module.weight.set_data(ms.numpy.randn(module.weight.shape).astype(np.float32) * 0.02)
+                if module.bias is not None:
+                    module.bias.set_data(ms.numpy.zeros(module.bias.shape, dtype=np.float32))
+        
+        self.apply(_basic_init)
+        
         for block in self.blocks:
             block.adaLN_modulation[-1].weight.set_data(ms.numpy.zeros(block.adaLN_modulation[-1].weight.shape, dtype=np.float32))
             block.adaLN_modulation[-1].bias.set_data(ms.numpy.zeros(block.adaLN_modulation[-1].bias.shape, dtype=np.float32))
@@ -227,26 +233,15 @@ class DiT(nn.Cell):
         x = self.final_layer(x, c)
         x = self.unpatchify(x)
         return x
-    
-    def forward(self, x, t, y):
-        return self.construct(x, t, y)
-
-    def forward_with_cfg(self, x, t, y, cfg_scale):
-        half_idx = x.shape[0] // 2
-        combined = ops.Concat(0)([x[:half_idx], x[:half_idx]])
-        model_out = self.forward(combined, t, y)
-        # Use all 4 channels for latent
-        eps = model_out[:, :4]
-        cond_eps = eps[:half_idx]
-        uncond_eps = eps[half_idx:]
-        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
-        # Duplicate to match original batch size
-        return ops.Concat(0)([half_eps, half_eps])
 
 
-#################################################################################
-#                   Sine/Cosine Positional Embedding Functions                  #
-#################################################################################
+def nn_init_normal_(tensor, std=0.02):
+    tensor.set_data(ms.numpy.randn(tensor.shape).astype(np.float32) * std)
+
+
+def nn_init_constant_(tensor, val=0.0):
+    tensor.set_data(ms.numpy.zeros(tensor.shape, dtype=np.float32) + val)
+
 
 def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
     grid_h = np.arange(grid_size, dtype=np.float32)
@@ -284,45 +279,41 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     return emb
 
 
-#################################################################################
-#                                   DiT Configs                                  #
-#################################################################################
-
 def DiT_XL_2(**kwargs):
-    return DiT(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
+    return DiT(depth=28, hidden_size=1152, num_heads=16, patch_size=2, input_size=kwargs.get('input_size', 32), learn_sigma=True)
 
-def DiT_XL_4(**kwargs):
-    return DiT(depth=28, hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
+def DiT_XL_4():
+    return DiT(depth=28, hidden_size=1152, num_heads=16, patch_size=4, input_size=32)
 
-def DiT_XL_8(**kwargs):
-    return DiT(depth=28, hidden_size=1152, patch_size=8, num_heads=16, **kwargs)
+def DiT_XL_8():
+    return DiT(depth=28, hidden_size=1152, num_heads=16, patch_size=8, input_size=32)
 
-def DiT_L_2(**kwargs):
-    return DiT(depth=24, hidden_size=1024, patch_size=2, num_heads=16, **kwargs)
+def DiT_L_2():
+    return DiT(depth=24, hidden_size=1024, num_heads=16, patch_size=2, input_size=32)
 
-def DiT_L_4(**kwargs):
-    return DiT(depth=24, hidden_size=1024, patch_size=4, num_heads=16, **kwargs)
+def DiT_L_4():
+    return DiT(depth=24, hidden_size=1024, num_heads=16, patch_size=4, input_size=32)
 
-def DiT_L_8(**kwargs):
-    return DiT(depth=24, hidden_size=1024, patch_size=8, num_heads=16, **kwargs)
+def DiT_L_8():
+    return DiT(depth=24, hidden_size=1024, num_heads=16, patch_size=8, input_size=32)
 
-def DiT_B_2(**kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
+def DiT_B_2():
+    return DiT(depth=12, hidden_size=768, num_heads=12, patch_size=2, input_size=32)
 
-def DiT_B_4(**kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=4, num_heads=12, **kwargs)
+def DiT_B_4():
+    return DiT(depth=12, hidden_size=768, num_heads=12, patch_size=4, input_size=32)
 
-def DiT_B_8(**kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=8, num_heads=12, **kwargs)
+def DiT_B_8():
+    return DiT(depth=12, hidden_size=768, num_heads=12, patch_size=8, input_size=32)
 
-def DiT_S_2(**kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=2, num_heads=6, **kwargs)
+def DiT_S_2():
+    return DiT(depth=12, hidden_size=384, num_heads=6, patch_size=2, input_size=32)
 
-def DiT_S_4(**kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=4, num_heads=6, **kwargs)
+def DiT_S_4():
+    return DiT(depth=12, hidden_size=384, num_heads=6, patch_size=4, input_size=32)
 
-def DiT_S_8(**kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=8, num_heads=6, **kwargs)
+def DiT_S_8():
+    return DiT(depth=12, hidden_size=384, num_heads=6, patch_size=8, input_size=32)
 
 
 DiT_models = {
