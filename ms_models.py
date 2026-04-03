@@ -150,6 +150,7 @@ class PatchEmbed(nn.Cell):
     def construct(self, x):
         B, C, H, W = x.shape
         x = self.proj(x)
+        x = ops.Transpose()(x, (0, 2, 3, 1))
         x = x.reshape(B, self.num_patches, -1)
         return x
 
