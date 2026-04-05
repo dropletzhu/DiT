@@ -6,8 +6,10 @@
 import argparse
 import os
 import sys
+import glob
 import numpy as np
 from pathlib import Path
+from PIL import Image
 
 import mindspore as ms
 from mindspore import mint, nn, ops
@@ -16,21 +18,64 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 os.environ['ASCEND_SLOG_PRINT_TO_STDOUT'] = '0'
 
+LATENT_SCALING_FACTOR = 0.18215
 
-class RandomLatentDataset:
-    """Random latent dataset for training without VAE."""
-    def __init__(self, num_samples, latent_size=32, num_classes=1000):
-        self.num_samples = num_samples
-        self.latent_size = latent_size
+
+class ImageNetDataset:
+    """ImageNet dataset loader with VAE encoding."""
+    def __init__(self, data_dir, vae, latent_scaling_factor=LATENT_SCALING_FACTOR, 
+                 image_size=256, num_classes=1000, max_samples=None):
+        self.data_dir = Path(data_dir) / "train"
+        self.vae = vae
+        self.latent_scaling_factor = latent_scaling_factor
+        self.image_size = image_size
         self.num_classes = num_classes
+        
+        self.image_paths = []
+        self.labels = []
+        
+        class_dirs = sorted(self.data_dir.iterdir())
+        for class_idx, class_dir in enumerate(class_dirs):
+            if class_idx >= num_classes:
+                break
+            if not class_dir.is_dir():
+                continue
+            
+            class_name = class_dir.name
+            images = list(class_dir.glob("*.JPEG")) + list(class_dir.glob("*.jpg"))
+            
+            for img_path in images:
+                self.image_paths.append(img_path)
+                self.labels.append(class_idx)
+            
+            if max_samples and len(self.image_paths) >= max_samples:
+                break
+        
+        print(f"Loaded {len(self.image_paths)} images from {len(set(self.labels))} classes")
     
     def __len__(self):
-        return self.num_samples
+        return len(self.image_paths)
     
     def __getitem__(self, idx):
-        latent = ms.Tensor(np.random.randn(4, self.latent_size, self.latent_size).astype(np.float32), dtype=ms.float32)
-        label = ms.Tensor([idx % self.num_classes], dtype=ms.int32)
-        return latent, label
+        img_path = self.image_paths[idx]
+        label = self.labels[idx]
+        
+        img = Image.open(img_path).convert("RGB")
+        img = img.resize((self.image_size, self.image_size), Image.BILINEAR)
+        
+        img_array = np.array(img).astype(np.float32) / 255.0
+        img_array = img_array * 2.0 - 1.0
+        img_tensor = ms.Tensor(img_array.transpose(2, 0, 1), dtype=ms.float32)
+        
+        h = self.vae.encode(img_tensor.unsqueeze(0), return_dict=False)[0]
+        mean = h[:, :4, :, :]
+        logvar = h[:, 4:, :, :]
+        std = ops.exp(0.5 * logvar)
+        noise = mint.randn_like(mean)
+        latent = mean + std * noise
+        latent = latent.squeeze(0) * self.latent_scaling_factor
+        
+        return latent, ms.Tensor(label, dtype=ms.int32)
 
 
 class DataLoader:
@@ -63,10 +108,30 @@ class DataLoader:
             labels.append(label)
         
         latents = ops.Stack()(latents)
-        labels = ops.Concat()(labels)
+        labels = ops.Stack()(labels)
         
         self.current_idx += self.batch_size
-        return latents, labels
+        return latents, labels.squeeze(-1)
+
+
+class DiTTrainStep(nn.Cell):
+    """Training step for DiT model."""
+    def __init__(self, network, alphas_cumprod):
+        super().__init__()
+        self.network = network.set_grad()
+        self.alphas_cumprod = alphas_cumprod
+        self.loss_fn = nn.MSELoss()
+    
+    def construct(self, latents, noise, t, class_labels):
+        """Forward pass with loss computation."""
+        sqrt_alpha_prod = ops.Sqrt()(ops.Gather()(self.alphas_cumprod, t, 0).reshape(-1, 1, 1, 1))
+        sqrt_one_minus_alpha_prod = ops.Sqrt()(1 - ops.Gather()(self.alphas_cumprod, t, 0).reshape(-1, 1, 1, 1))
+        noisy_latents = sqrt_alpha_prod * latents + sqrt_one_minus_alpha_prod * noise
+        
+        model_pred = self.network(noisy_latents, timestep=t, class_labels=class_labels)[0]
+        model_pred = model_pred[:, :4, :, :]
+        
+        return self.loss_fn(model_pred, noise)
 
 
 def main(args):
@@ -114,12 +179,29 @@ def main(args):
     alphas_cumprod = np.cumprod(alphas, axis=0)
     alphas_cumprod = ms.Tensor(alphas_cumprod, dtype=ms.float32)
     
+    train_step = DiTTrainStep(model, alphas_cumprod)
     from mindspore.nn import Adam
     optimizer = Adam(model.trainable_params(), learning_rate=args.lr, weight_decay=0)
     
-    num_samples = args.num_samples or 10000
-    dataset = RandomLatentDataset(num_samples, latent_size=latent_size)
-    print(f"Dataset contains {num_samples} samples (random latents)")
+    if args.data_path:
+        from mindone.diffusers import AutoencoderKL
+        print(f"Loading VAE from {args.vae_path}")
+        vae = AutoencoderKL.from_pretrained(args.vae_path)
+        vae.set_train(False)
+        
+        print(f"Loading ImageNet from {args.data_path}")
+        dataset = ImageNetDataset(
+            args.data_path, 
+            vae=vae,
+            latent_scaling_factor=LATENT_SCALING_FACTOR,
+            image_size=args.image_size,
+            num_classes=1000,
+            max_samples=args.num_samples,
+        )
+    else:
+        raise ValueError("Please specify --data-path")
+    
+    print(f"Dataset contains {len(dataset)} samples")
     
     train_steps = 0
     running_loss = 0
@@ -136,28 +218,20 @@ def main(args):
             
             noise = mint.randn_like(latents)
             
-            sqrt_alpha_prod = ops.Sqrt()(ops.Gather()(alphas_cumprod, t, 0).reshape(-1, 1, 1, 1))
-            sqrt_one_minus_alpha_prod = ops.Sqrt()(1 - ops.Gather()(alphas_cumprod, t, 0).reshape(-1, 1, 1, 1))
-            noisy_latents = sqrt_alpha_prod * latents + sqrt_one_minus_alpha_prod * noise
-            
             class_labels = labels
             if model.class_dropout_prob > 0:
                 mask = mint.rand((batch_size,), dtype=ms.float32) < model.class_dropout_prob
                 null_class = ms.Tensor([1000] * batch_size, dtype=ms.int32)
                 class_labels = mint.where(mask, null_class, labels)
             
-            model.set_grad(True)
-            model_pred = model(noisy_latents, timestep=t, class_labels=class_labels)[0]
+            grad_fn = ms.value_and_grad(train_step, None, model.trainable_params())
+            loss, grad = grad_fn(latents, noise, t, class_labels)
             
-            loss = ops.mse_loss(model_pred, noise, reduction='mean')
-            
-            loss.backward()
-            optimizer.step()
-            optimizer.clear_grad()
+            optimizer(grad)
             
             decay = 0.9999
-            ema_params = dict(ema.named_parameters())
-            model_params = dict(model.named_parameters())
+            ema_params = {p.name: p for p in ema.get_parameters()}
+            model_params = {p.name: p for p in model.get_parameters()}
             for name, param in model_params.items():
                 if name in ema_params:
                     ema_p = ema_params[name]
@@ -196,6 +270,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--results-dir", type=str, default="ms_train_output", help="Output directory")
     parser.add_argument("--model", type=str, default="DiT-XL/2", help="Model name")
+    parser.add_argument("--data-path", type=str, default=None, help="Path to ImageNet dataset")
+    parser.add_argument("--vae-path", type=str, default="/home/ma-user/work/temp/sd-vae-ft-mse", help="Path to VAE")
     parser.add_argument("--image-size", type=int, default=256, help="Image size")
     parser.add_argument("--epochs", type=int, default=1, help="Number of epochs")
     parser.add_argument("--global-batch-size", type=int, default=4, help="Batch size")
@@ -204,7 +280,7 @@ if __name__ == "__main__":
     parser.add_argument("--log-every", type=int, default=10, help="Log frequency")
     parser.add_argument("--ckpt-every", type=int, default=1, help="Checkpoint frequency (epochs)")
     parser.add_argument("--max-steps", type=int, default=None, help="Max training steps")
-    parser.add_argument("--num-samples", type=int, default=10000, help="Number of samples")
+    parser.add_argument("--num-samples", type=int, default=None, help="Number of samples to use")
     parser.add_argument("--device-id", type=int, default=0, help="NPU device ID")
     
     args = parser.parse_args()

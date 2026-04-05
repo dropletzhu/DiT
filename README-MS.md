@@ -1,20 +1,78 @@
 # MindSpore DiT (Scalable Diffusion Models with Transformers)
 
-MindSpore implementation of DiT for Ascend NPU.
+MindSpore implementation of DiT for Ascend NPU, based on [mindone](https://github.com/mindspore-lab/mindone).
 
 ## 环境配置
 
 ```bash
-# 安装 MindSpore
-pip install mindspore
+# 安装 MindSpore 和 mindone
+pip install mindspore mindone
 
-# 或使用 conda
-conda install mindspore -c mindspore
+# 克隆 mindone (如需要)
+git clone https://github.com/mindspore-lab/mindone.git
+```
+
+## 快速开始
+
+### 1. 下载 PyTorch 预训练权重
+
+```bash
+# DiT-XL/2 (256x256)
+wget https://dl.fbaipublicfiles.com/dit/dit-xl-2-256x256.pt
+
+# DiT-XL/2 (512x512)
+wget https://dl.fbaipublicfiles.com/dit/dit-xl-2-512x512.pt
+```
+
+### 2. 转换检查点
+
+```bash
+# 转换 256x256 模型
+python -m mindone.examples.dit.scripts.convert_dit_checkpoint \
+    --model dit_xl_2 \
+    --input <path-to-dit-xl-2-256x256.pt> \
+    --output DiT-XL-2-256x256.ckpt
+
+# 转换 512x512 模型
+python -m mindone.examples.dit.scripts.convert_dit_checkpoint \
+    --model dit_xl_2 \
+    --input <path-to-dit-xl-2-512x512.pt> \
+    --output DiT-XL-2-512x512.ckpt \
+    --image_size 512
+```
+
+### 3. 推理
+
+```bash
+# 使用 generate.py (推荐)
+python generate.py \
+    --checkpoint DiT-XL-2-256x256.ckpt \
+    --image-size 256 \
+    --num-samples 4 \
+    --cfg-scale 4.0 \
+    --seed 42
+
+# 或使用 ms_sample.py
+python ms_sample.py \
+    --checkpoint DiT-XL-2-256x256.ckpt \
+    --image-size 256 \
+    --num-samples 4
+```
+
+### 4. 训练
+
+```bash
+python ms_train.py \
+    --data-path /path/to/imagenet-mini \
+    --vae-path /path/to/sd-vae-ft-mse \
+    --image-size 256 \
+    --epochs 100 \
+    --global-batch-size 8 \
+    --lr 1e-4 \
+    --max-steps 100000
 ```
 
 ## 模型架构
-
-支持以下 DiT 模型配置:
 
 | 模型 | 参数量 | 隐藏维度 | 头数 | 层数 |
 |------|--------|----------|------|------|
@@ -23,151 +81,124 @@ conda install mindspore -c mindspore
 | DiT-L/2 | 457M | 1024 | 16 | 24 |
 | DiT-XL/2 | 657M | 1152 | 16 | 28 |
 
-## 推理
+## 推理脚本说明
 
-### 命令行参数
+### generate.py (推荐)
 
-```bash
-python ms_sample.py [选项]
-```
+基于 mindone 的完整推理脚本。
 
 **参数说明:**
 
 | 参数 | 默认值 | 描述 |
 |------|--------|------|
-| `--model` | DiT-XL/2 | 模型架构 |
+| `--checkpoint` | (必填) | MindSpore 检查点路径 |
 | `--image-size` | 256 | 图像尺寸 (256 或 512) |
-| `--num-classes` | 1000 | 类别数量 |
-| `--num-samples` | 8 | 生成样本数量 |
+| `--num-samples` | 1 | 生成样本数量 |
 | `--cfg-scale` | 4.0 | Classifier-free guidance 比例 |
+| `--num-sampling-steps` | 50 | 采样步数 |
+| `--seed` | 42 | 随机种子 |
+| `--class-label` | None | 指定类别 (0-999) |
+| `--vae-path` | None | VAE 路径 (用于重建) |
+
+### ms_sample.py
+
+简化的推理脚本。
+
+**参数说明:**
+
+| 参数 | 默认值 | 描述 |
+|------|--------|------|
+| `--checkpoint` | (必填) | MindSpore 检查点路径 |
+| `--model` | DiT-XL/2 | 模型架构 |
+| `--image-size` | 256 | 图像尺寸 |
+| `--num-samples` | 8 | 生成样本数量 |
+| `--cfg-scale` | 4.0 | CFG 比例 |
 | `--num-sampling-steps` | 10 | 采样步数 |
 | `--seed` | 0 | 随机种子 |
 
-### 使用示例
+## 训练脚本说明
 
-```bash
-# 使用 DiT-S/2 生成 256x256 图像
-python ms_sample.py --model DiT-S/2 --image-size 256 --num-sampling-steps 20
+### ms_train.py
 
-# 使用 DiT-XL/2 生成 512x512 图像
-python ms_sample.py --model DiT-XL/2 --image-size 512 --num-sampling-steps 50 --cfg-scale 4.0
-```
-
-### 推理输出
-
-生成的图像保存在当前目录，文件名格式为 `ms_sample_0.png`, `ms_sample_1.png`, ...
-
-## 训练
-
-### 命令行参数
-
-```bash
-python ms_train.py --data-path <数据集路径> [选项]
-```
+使用 VAE 编码 ImageNet 图像进行训练。
 
 **参数说明:**
 
 | 参数 | 默认值 | 描述 |
 |------|--------|------|
-| `--data-path` | (必填) | ImageNet 训练数据路径 |
-| `--results-dir` | ms_results | 结果保存目录 |
-| `--model` | DiT-XL/2 | 模型架构 |
+| `--data-path` | (必填) | ImageNet 数据路径 |
+| `--vae-path` | /home/ma-user/work/temp/sd-vae-ft-mse | VAE 路径 |
+| `--results-dir` | ms_train_output | 输出目录 |
 | `--image-size` | 256 | 图像尺寸 |
-| `--num-classes` | 1000 | 类别数量 |
 | `--epochs` | 1 | 训练轮数 |
-| `--global-batch-size` | 4 | 全局批量大小 |
-| `--global-seed` | 0 | 随机种子 |
-| `--log-every` | 10 | 日志输出频率 |
-| `--ckpt-every` | 100 | 检查点保存频率 |
-| `--test` | False | 测试模式 (只运行几步) |
+| `--global-batch-size` | 4 | 批量大小 |
+| `--lr` | 1e-4 | 学习率 |
+| `--max-steps` | None | 最大步数 |
+| `--log-every` | 10 | 日志频率 |
+| `--ckpt-every` | 1 | 检查点保存频率 |
+| `--num-samples` | None | 使用样本数 (默认全部) |
+| `--device-id` | 0 | NPU 设备 ID |
 
-### 使用示例
+**示例:**
 
 ```bash
-# 使用 DiT-S/2 训练 (测试模式)
-python ms_train.py --model DiT-S/2 --data-path /path/to/imagenet/train --test
+# 训练 1000 步
+python ms_train.py \
+    --data-path /home/ma-user/work/temp/kagglehub/datasets/ifigotin/imagenetmini-1000/versions/1/imagenet-mini \
+    --vae-path /home/ma-user/work/temp/sd-vae-ft-mse \
+    --max-steps 1000 \
+    --global-batch-size 4
 
-# 使用 DiT-B/2 完整训练
-python ms_train.py --model DiT-B/2 --data-path /path/to/imagenet/train \
-    --epochs 100 --global-batch-size 16 --image-size 256
+# 完整训练
+python ms_train.py \
+    --data-path /path/to/imagenet/train \
+    --vae-path /path/to/sd-vae-ft-mse \
+    --epochs 100 \
+    --global-batch-size 8 \
+    --lr 1e-4
 ```
 
-### 检查点
+## 检查点格式
 
-训练过程中检查点保存在 `--results-dir` 指定的目录:
-- 格式: `ckpt_0001000.ckpt`, `ckpt_0002000.ckpt`, ...
-- 最终检查点: `final.ckpt`
-
-### 加载检查点进行推理
-
-```python
-import mindspore as ms
-from ms_models import DiT_models
-
-model = DiT_models["DiT-S/2"](input_size=32, num_classes=1000)
-ms.load_checkpoint("ms_results/final.ckpt", model)
-model.set_train(False)
-```
+MindSpore 检查点包含以下参数:
+- `pos_embed.pos_embed`: 位置嵌入
+- `patch_embed.*`: 补丁嵌入层
+- `transformer_blocks.*`: Transformer 块
+- `final_layer.*`: 最终输出层
+- ` timestep_embedder.*`: 时间步嵌入
+- `label_embedder.*`: 类别嵌入
 
 ## 与 PyTorch 版本对比
 
 | 特性 | PyTorch | MindSpore |
 |------|---------|-----------|
-| 推理脚本 | sample.py | ms_sample.py |
+| 推理脚本 | sample.py | generate.py / ms_sample.py |
 | 训练脚本 | train.py | ms_train.py |
-| 模型定义 | models.py | ms_models.py |
-| 设备支持 | CUDA/NPU | Ascend NPU |
+| 模型定义 | models.py | mindone DiTTransformer2DModel |
+| 设备支持 | CUDA | Ascend NPU |
 
 ## 注意事项
 
-1. **当前版本使用简化 Diffusion**: 使用简化的 DDPM 采样和训练过程
-2. **数据集**: 完整训练需要 ImageNet 数据集
-3. **设备**: 脚本默认使用 Ascend NPU (device_id=0)
-4. **混合精度**: 当前版本未启用 AMP
+1. **mindone 依赖**: 使用 mindone 的 DiTTransformer2DModel 和相关模块
+2. **VAE**: 训练需要 VAE 进行图像编码,推荐使用 sd-vae-ft-mse
+3. **ImageNet**: 数据集需要包含 train/val 目录结构,每个类别一个子目录
+4. **设备**: 脚本默认使用 Ascend NPU (device_id=0)
+5. **混合精度**: 当前版本未启用 AMP
 
-## 测试报告
+## 目录结构
 
-### 测试环境
-
-- **硬件**: Ascend NPU
-- **MindSpore 版本**: 2.8.0
-- **测试日期**: 2026-03-25
-
-### 推理测试
-
-```bash
-python ms_sample.py --model DiT-S/2 --image-size 256 --num-sampling-steps 10 --seed 42
 ```
-
-**测试结果**: ✅ 通过
-
-| 指标 | 结果 |
-|------|------|
-| 模型加载 | 成功 |
-| 采样步数 | 10 |
-| 生成样本数 | 8 |
-| 输出文件 | ms_sample_0.png ~ ms_sample_7.png |
-
-### 训练测试
-
-```bash
-python ms_train.py --model DiT-S/2 --data-path <imagenet-path> --test
+DiT/
+├── generate.py          # 推理脚本 (mindone)
+├── ms_sample.py         # 简化推理脚本
+├── ms_train.py          # 训练脚本
+├── ms_models.py         # 模型封装
+├── dit/                 # mindone 训练模块
+│   ├── train_pipeline.py
+│   └── dataset.py
+└── ms_checkpoints/      # 转换后的检查点
+    └── DiT-XL-2-256x256.ckpt
 ```
-
-**测试结果**: ✅ 通过
-
-| 指标 | 结果 |
-|------|------|
-| 模型参数量 | 32,982,560 (33M) |
-| 数据集大小 | 1000 images |
-| 训练步数 | 10 |
-| 最终 Loss | 1.0024 |
-| EMA 更新 | 正常 |
-
-### 已知问题
-
-1. **弃用警告**: MindSpore 2.8.0 对 `device_target` 和 `device_id` 参数发出弃用警告，建议使用 `mindspore.set_device()` 代替
-2. **简化 Diffusion**: 当前使用简化 DDPM，未使用完整的 diffusion 库
 
 ## 许可证
 

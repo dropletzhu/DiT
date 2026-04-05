@@ -4,18 +4,18 @@ import torch
 
 
 def get_device():
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    elif hasattr(torch, "npu") and torch.npu.is_available():
+    if hasattr(torch, "npu") and torch.npu.is_available():
         return torch.device("npu")
+    elif torch.cuda.is_available():
+        return torch.device("cuda")
     return torch.device("cpu")
 
 
 def get_device_str():
-    if torch.cuda.is_available():
-        return "cuda"
-    elif hasattr(torch, "npu") and torch.npu.is_available():
+    if hasattr(torch, "npu") and torch.npu.is_available():
         return "npu"
+    elif torch.cuda.is_available():
+        return "cuda"
     return "cpu"
 
 
@@ -24,18 +24,18 @@ def get_device_type(device):
 
 
 def get_device_count():
-    if torch.cuda.is_available():
-        return torch.cuda.device_count()
-    elif hasattr(torch, "npu") and torch.npu.is_available():
+    if hasattr(torch, "npu") and torch.npu.is_available():
         return torch.npu.device_count()
+    elif torch.cuda.is_available():
+        return torch.cuda.device_count()
     return 1
 
 
 def set_device(device_id):
-    if torch.cuda.is_available():
-        torch.cuda.set_device(device_id)
-    elif hasattr(torch, "npu") and torch.npu.is_available():
+    if hasattr(torch, "npu") and torch.npu.is_available():
         torch.npu.set_device(device_id)
+    elif torch.cuda.is_available():
+        torch.cuda.set_device(device_id)
 
 
 def set_device_override(device_str):
@@ -55,15 +55,26 @@ def enable_tf32(enabled=True):
 
 
 def get_distributed_backend():
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return "hccl"
     return "nccl"
 
 
 def get_autocast(enabled, dtype):
-    return torch.cuda.amp.autocast(enabled=enabled, dtype=dtype) if enabled else None
+    if enabled:
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            return torch.npu.amp.autocast(enabled=enabled, dtype=dtype)
+        elif torch.cuda.is_available():
+            return torch.cuda.amp.autocast(enabled=enabled, dtype=dtype)
+    return None
 
 
-def get_amp_scaler():
-    return torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
+def get_amp_scaler(device=None):
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        return torch.npu.amp.GradScaler()
+    elif torch.cuda.is_available():
+        return torch.cuda.amp.GradScaler()
+    return None
 
 
 def is_npu():
@@ -79,6 +90,7 @@ def is_available():
 
 
 def add_device_args(parser):
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cuda", "npu", "cpu"])
     parser.add_argument("--device_id", type=int, default=0)
     parser.add_argument("--amp", action="store_true", default=True)
     parser.add_argument("--no_amp", action="store_true", default=False)

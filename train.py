@@ -63,14 +63,15 @@ def cleanup():
     """
     End DDP training.
     """
-    dist.destroy_process_group()
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ and 'MASTER_ADDR' in os.environ:
+        dist.destroy_process_group()
 
 
-def create_logger(logging_dir):
+def create_logger(logging_dir, rank=0):
     """
     Create a logger that writes to a log file and stdout.
     """
-    if dist.get_rank() == 0:  # real logger
+    if rank == 0:  # real logger
         logging.basicConfig(
             level=logging.INFO,
             format='[\033[34m%(asctime)s\033[0m] %(message)s',
@@ -78,8 +79,8 @@ def create_logger(logging_dir):
             handlers=[logging.StreamHandler(), logging.FileHandler(f"{logging_dir}/log.txt")]
         )
         logger = logging.getLogger(__name__)
-    else:  # dummy logger (does nothing)
-        logger = logging.getLogger(__name__)
+    else:  # dummy logger (do nothing)
+        logger = logging.getLogger("dummy")
         logger.addHandler(logging.NullHandler())
     return logger
 
@@ -123,21 +124,39 @@ def main(args):
     device_count = get_device_count()
     assert device_count >= 1, "Training currently requires at least one GPU or NPU."
 
-    # Setup DDP:
-    dist.init_process_group(get_distributed_backend())
-    assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
-    rank = dist.get_rank()
-    device_type = get_device_type()
-    if device_type == 'cpu':
-        device = torch.device('cpu')
-        device_id = None
+    # Setup PyTorch DDP (single GPU/NPU fallback)
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ and 'MASTER_ADDR' in os.environ:
+        dist.init_process_group(get_distributed_backend())
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        device_count = get_device_count()
+        device_type = get_device_type(rank % device_count if device_count > 0 else 0)
+        if device_type == 'cpu':
+            device = torch.device('cpu')
+            device_id = None
+        else:
+            device_id = rank % device_count
+            device = device_id
+            set_device(device_id)
     else:
-        device_id = rank % device_count
-        device = device_id
-        set_device(device_id)
-    seed = args.global_seed * dist.get_world_size() + rank
+        # Single device fallback
+        rank = 0
+        world_size = 1
+        device_count = get_device_count()
+        device_type = get_device_type(0) if device_count > 0 else 'cpu'
+        if device_type == 'cpu':
+            device = torch.device('cpu')
+            device_id = None
+        else:
+            device_id = 0
+            device = device_id
+            set_device(device_id)
+        print(f"Running in single device mode: device={device}, device_type={device_type}")
+    
+    assert args.global_batch_size % world_size == 0, f"Batch size must be divisible by world size."
+    seed = args.global_seed * world_size + rank
     torch.manual_seed(seed)
-    print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}, device={device}.")
+    print(f"Starting rank={rank}, seed={seed}, world_size={world_size}, device={device}.")
 
     # Setup an experiment folder:
     if rank == 0:
@@ -147,10 +166,10 @@ def main(args):
         experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{model_string_name}"  # Create an experiment folder
         checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
         os.makedirs(checkpoint_dir, exist_ok=True)
-        logger = create_logger(experiment_dir)
+        logger = create_logger(experiment_dir, rank)
         logger.info(f"Experiment directory created at {experiment_dir}")
     else:
-        logger = create_logger(None)
+        logger = create_logger(None, rank)
 
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
@@ -162,10 +181,13 @@ def main(args):
     # Note that parameter initialization is done within the DiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
-    if device_type == 'cpu':
-        model = DDP(model.to(device))
+    if world_size > 1:
+        if device_type == 'cpu':
+            model = DDP(model.to(device))
+        else:
+            model = DDP(model.to(device), device_ids=[device_id])
     else:
-        model = DDP(model.to(device), device_ids=[device_id])
+        model = model.to(device)  # Single device, no DDP wrapper
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
     if args.vae_path:
         vae = AutoencoderKL.from_pretrained(args.vae_path).to(device)
@@ -184,26 +206,39 @@ def main(args):
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
     ])
     dataset = ImageFolder(args.data_path, transform=transform)
-    sampler = DistributedSampler(
-        dataset,
-        num_replicas=dist.get_world_size(),
-        rank=rank,
-        shuffle=True,
-        seed=args.global_seed
-    )
-    loader = DataLoader(
-        dataset,
-        batch_size=int(args.global_batch_size // dist.get_world_size()),
-        shuffle=False,
-        sampler=sampler,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True
-    )
+    
+    if world_size > 1:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True,
+            seed=args.global_seed
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=int(args.global_batch_size // world_size),
+            shuffle=False,
+            sampler=sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True
+        )
+    else:
+        loader = DataLoader(
+            dataset,
+            batch_size=int(args.global_batch_size),
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True
+        )
     logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
 
     # Prepare models for training:
-    update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
+    # Use model.module if wrapped in DDP, otherwise use model directly
+    model_for_ema = model.module if hasattr(model, 'module') else model
+    update_ema(ema, model_for_ema, decay=0)  # Ensure EMA is initialized with synced weights
     model.train()  # important! This enables embedding dropout for classifier-free guidance
     ema.eval()  # EMA model should always be in eval mode
 
@@ -215,7 +250,8 @@ def main(args):
 
     logger.info(f"Training for {args.epochs} epochs (AMP: {amp_enabled}, dtype: {amp_dtype})...")
     for epoch in range(args.epochs):
-        sampler.set_epoch(epoch)
+        if world_size > 1:
+            sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
         for x, y in loader:
             x = x.to(device)
@@ -226,7 +262,7 @@ def main(args):
             model_kwargs = dict(y=y)
             
             opt.zero_grad()
-            with get_autocast(amp_enabled, amp_dtype):
+            with torch.npu.amp.autocast(enabled=amp_enabled, dtype=amp_dtype) if hasattr(torch, 'npu') else get_autocast(amp_enabled, amp_dtype):
                 loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
                 loss = loss_dict["loss"].mean()
             
@@ -242,7 +278,8 @@ def main(args):
                 if args.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 opt.step()
-            update_ema(ema, model.module)
+            model_for_ema = model.module if hasattr(model, 'module') else model
+            update_ema(ema, model_for_ema)
 
             # Log loss values:
             running_loss += loss.item()
@@ -255,9 +292,12 @@ def main(args):
                 synchronize()
                 end_time = time()
                 steps_per_sec = log_steps / (end_time - start_time)
-                avg_loss = torch.tensor(running_loss / log_steps, device=device)
-                dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-                avg_loss = avg_loss.item() / dist.get_world_size()
+                if world_size > 1:
+                    avg_loss = torch.tensor(running_loss / log_steps, device=device)
+                    dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
+                    avg_loss = avg_loss.item() / world_size
+                else:
+                    avg_loss = running_loss / log_steps
                 logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
                 running_loss = 0
                 log_steps = 0
@@ -266,8 +306,9 @@ def main(args):
             # Save DiT checkpoint:
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
                 if rank == 0:
+                    model_for_save = model.module if hasattr(model, 'module') else model
                     checkpoint = {
-                        "model": model.module.state_dict(),
+                        "model": model_for_save.state_dict(),
                         "ema": ema.state_dict(),
                         "opt": opt.state_dict(),
                         "args": args
@@ -275,7 +316,8 @@ def main(args):
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
                     logger.info(f"Saved checkpoint to {checkpoint_path}")
-                dist.barrier()
+                if world_size > 1:
+                    dist.barrier()
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
