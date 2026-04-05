@@ -36,7 +36,28 @@ from mindone.diffusers import (
 )
 from mindone.utils import set_logger
 
-ms.set_context(device_target="Ascend", mode=ms.PYNATIVE_MODE)
+# Parse args first to get mode
+def parse_args():
+    parser = argparse.ArgumentParser(description="DiT Image Generation Inference")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
+    parser.add_argument("--output_dir", type=str, default="./generated_images", help="Output directory")
+    parser.add_argument("--num_images", type=int, default=1, help="Number of images to generate")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size per generation")
+    parser.add_argument("--num_inference_steps", type=int, default=50, help="Number of denoising steps")
+    parser.add_argument("--guidance_scale", type=float, default=4.0, help="Classifier-free guidance scale")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--image_size", type=int, default=256, help="Output image size")
+    parser.add_argument("--dtype", type=str, default="fp32", choices=["fp32", "fp16", "bf16"], help="Model dtype")
+    parser.add_argument("--scheduler", type=str, default="ddim", choices=["ddim", "ddpm", "dpm"], help="Scheduler type")
+    parser.add_argument("--eta", type=float, default=0.0, help="DDIM eta parameter")
+    parser.add_argument("--class_labels", type=str, default=None, help="Comma-separated class labels (e.g., 'tench,goldfish,hen') or 'random'")
+    parser.add_argument("--pretrained_model", type=str, default=None, help="HuggingFace model ID or path (alternative to checkpoint)")
+    parser.add_argument("--vae_model", type=str, default=None, help="VAE model path or HuggingFace model ID")
+    parser.add_argument("--mode", type=str, default="pynative", choices=["pynative", "graph"], help="MindSpore execution mode")
+    return parser.parse_args()
+
+args = parse_args()
+ms.set_context(device_target="Ascend", mode=ms.PYNATIVE_MODE if args.mode == "pynative" else ms.GRAPH_MODE)
 
 logger = logging.getLogger(__name__)
 
@@ -57,40 +78,6 @@ IMAGENET_CLASS_LABELS = {
     "bulbul": 13,
     "jay": 14,
 }
-
-
-def parse_args():
-    parser = argparse.ArgumentParser(description="DiT Image Generation Inference")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
-    parser.add_argument("--output_dir", type=str, default="./generated_images", help="Output directory")
-    parser.add_argument("--num_images", type=int, default=4, help="Number of images to generate")
-    parser.add_argument("--batch_size", type=int, default=1, help="Batch size per generation")
-    parser.add_argument("--num_inference_steps", type=int, default=50, help="Number of denoising steps")
-    parser.add_argument("--guidance_scale", type=float, default=4.0, help="Classifier-free guidance scale")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--image_size", type=int, default=256, help="Output image size")
-    parser.add_argument("--dtype", type=str, default="fp32", choices=["fp32", "fp16", "bf16"], help="Model dtype")
-    parser.add_argument("--scheduler", type=str, default="ddim", choices=["ddim", "ddpm", "dpm"], help="Scheduler type")
-    parser.add_argument("--eta", type=float, default=0.0, help="DDIM eta parameter")
-    parser.add_argument(
-        "--class_labels",
-        type=str,
-        default=None,
-        help="Comma-separated class labels (e.g., 'tench,goldfish,hen') or 'random'",
-    )
-    parser.add_argument(
-        "--pretrained_model",
-        type=str,
-        default=None,
-        help="HuggingFace model ID or path (alternative to checkpoint)",
-    )
-    parser.add_argument(
-        "--vae_model",
-        type=str,
-        default="stabilityai/sd-vae-ft-mse",
-        help="VAE model path or HuggingFace model ID",
-    )
-    return parser.parse_args()
 
 
 def set_seed(seed: int):

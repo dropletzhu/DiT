@@ -18,7 +18,7 @@
 - CFG Scale: 4.0
 - Seed: 42
 
-### 测试结果 (3次运行)
+### 测试结果 (PyNative Mode, 3次运行)
 
 | Run | 总时间 (秒) | 平均时间 (秒) |
 |-----|------------|--------------|
@@ -39,8 +39,9 @@
 - 训练步数: 100
 - 数据集: ImageNet-mini (5,050 images)
 - AMP: 关闭
+- 执行模式: PyNative
 
-### 测试结果 (3次运行)
+### 测试结果 (PyNative Mode, 3次运行)
 
 | Run | 总时间 (秒) | 平均时间 (秒) | 平均 Loss |
 |-----|------------|--------------|-----------|
@@ -53,8 +54,28 @@
 - 平均训练速度: 0.64 steps/sec
 - 每 step 耗时: 1.56 秒
 
+## Graph Mode 测试
+
+### 结果
+- **推理**: 编译失败 (RuntimeError: compile graph kernel_graph0 failed)
+- **训练**: 编译失败 (RuntimeError: compile graph kernel_graph0 failed)
+
+### 错误分析
+Graph mode 在当前 mindone 版本上存在兼容性问题:
+1. 动态控制流 (如 if/for) 与静态图编译不兼容
+2. 时序嵌入 (timestep embedding) 编译失败
+3. 需要修改模型代码以适配 graph mode
+
+### PyNative vs Graph 模式对比
+
+| 模式 | 推理性能 | 训练性能 | 可用性 |
+|------|---------|---------|--------|
+| PyNative | 82.7秒/张 | 1.56秒/step | ✅ 可用 |
+| Graph | 编译失败 | 编译失败 | ❌ 不可用 |
+
 ## 总结
 
 MindSpore 在 Ascend NPU 上运行 DiT-XL/2:
-- 推理: 约 83 秒/张
-- 训练: 约 1.56 秒/step
+- 推理: 约 83 秒/张 (PyNative)
+- 训练: 约 1.56 秒/step (PyNative)
+- Graph mode 当前不可用，需进一步优化

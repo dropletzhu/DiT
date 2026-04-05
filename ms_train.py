@@ -138,7 +138,7 @@ def main(args):
     ms.set_context(
         device_target="Ascend", 
         device_id=args.device_id,
-        mode=ms.PYNATIVE_MODE,
+        mode=ms.PYNATIVE_MODE if args.mode == "pynative" else ms.GRAPH_MODE,
     )
     
     ms.set_seed(args.global_seed)
@@ -282,6 +282,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-steps", type=int, default=None, help="Max training steps")
     parser.add_argument("--num-samples", type=int, default=None, help="Number of samples to use")
     parser.add_argument("--device-id", type=int, default=0, help="NPU device ID")
+    parser.add_argument("--mode", type=str, default="pynative", choices=["pynative", "graph"], help="MindSpore execution mode")
     
     args = parser.parse_args()
     main(args)
