@@ -198,6 +198,20 @@ def main(args):
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
 
+    # Resume from checkpoint if provided:
+    train_steps = 0
+    if args.ckpt:
+        if rank == 0:
+            logger.info(f"Loading checkpoint from {args.ckpt}")
+        ckpt_data = torch.load(args.ckpt, map_location="cpu")
+        raw_model = model.module if hasattr(model, 'module') else model
+        raw_model.load_state_dict(ckpt_data["model"])
+        ema.load_state_dict(ckpt_data["ema"])
+        opt.load_state_dict(ckpt_data["opt"])
+        train_steps = ckpt_data.get("train_steps", 0)
+        if rank == 0:
+            logger.info(f"Resumed from step {train_steps}")
+
     # Setup data:
     transform = transforms.Compose([
         transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
@@ -238,12 +252,12 @@ def main(args):
     # Prepare models for training:
     # Use model.module if wrapped in DDP, otherwise use model directly
     model_for_ema = model.module if hasattr(model, 'module') else model
-    update_ema(ema, model_for_ema, decay=0)  # Ensure EMA is initialized with synced weights
+    if not args.ckpt:
+        update_ema(ema, model_for_ema, decay=0)  # Ensure EMA is initialized with synced weights
     model.train()  # important! This enables embedding dropout for classifier-free guidance
     ema.eval()  # EMA model should always be in eval mode
 
     # Variables for monitoring/logging purposes:
-    train_steps = 0
     log_steps = 0
     running_loss = 0
     start_time = time()
@@ -311,7 +325,8 @@ def main(args):
                         "model": model_for_save.state_dict(),
                         "ema": ema.state_dict(),
                         "opt": opt.state_dict(),
-                        "args": args
+                        "args": args,
+                        "train_steps": train_steps,
                     }
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
@@ -345,6 +360,8 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt-every", type=int, default=50_000)
     parser.add_argument("--grad-clip", type=float, default=1.0, help="Gradient clipping value (0 to disable)")
     parser.add_argument("--max-steps", type=int, default=None, help="Maximum training steps (default: unlimited)")
+    parser.add_argument("--ckpt", type=str, default=None,
+                        help="Path to a checkpoint .pt file to resume training from")
     add_device_args(parser)
     args = parser.parse_args()
     if args.device != "auto":
