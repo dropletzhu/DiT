@@ -407,22 +407,71 @@ MindSpore 使用的 `mindone.models.dit.DiT_models` 与 PyTorch 的 `models.DiT_
 
 ### 5.1 训练性能
 
-#### DiT-XL/2, 256x256, Global Batch Size 256
+#### DiT-XL/2, 256x256, 8x 910B3 NPU
 
-| 配置 | 设备 | Steps/Sec | 单步耗时 | 500K步预计时间 |
-|------|------|-----------|---------|--------------|
-| PyTorch + torch_npu | 8x 910B3 (64GB) | ~1.05 | 0.95s | ~132 小时 |
-| MindSpore (pynative) | 8x 910B3 (64GB) | ~1.05 | 0.95s | ~132 小时 |
-| PyTorch (A100 参考) | 8x A100 (80GB) | ~1.75 | 0.57s | ~79 小时 |
+**PyTorch + torch_npu vs MindSpore（相同参数）**
 
-#### 单卡训练性能对比
+| 配置 | 框架 | Batch Size | Steps/Sec | 单步耗时 | HBM 使用 |
+|------|------|-----------|-----------|---------|---------|
+| BS=256 | PyTorch + torch_npu | 256 (每卡32) | ~1.07 | 0.93s | ~37GB |
+| BS=256 | MindSpore (pynative) | 256 (每卡32) | ~1.07 | 0.93s | ~37GB |
+| BS=512 | MindSpore (pynative) | 512 (每卡64) | ~0.76 | 1.32s | ~51GB |
+
+**A100 参考性能**
+
+| 配置 | 设备 | Batch Size | Steps/Sec | 单步耗时 |
+|------|------|-----------|-----------|---------|
+| BS=256 | 8x A100 (80GB) | 256 | ~1.75 | 0.57s |
+| BS=256 | 8x 910B3 (64GB) | 256 | ~1.07 | 0.93s |
+
+> 910B3 比 A100 慢约 40%，主要因为计算架构和软件栈成熟度差异。
+
+#### 训练性能优化
+
+通过增大 Batch Size 和调整训练参数，显著提升了训练吞吐量：
+
+| 优化项 | 优化前 | 优化后 | 效果 |
+|--------|--------|--------|------|
+| Global Batch Size | 256 | 512 | 每步样本数翻倍 |
+| num_workers | 4 | 8 | 数据加载加速 |
+| ckpt 保存间隔 | 10,000 步 | 25,000 步 | IO 等待减少 |
+| max_steps | 500,000 | 250,000 | 总步数减半（保持相同总样本数）|
+| HBM 使用率 | 57% (37GB/64GB) | 78% (51GB/64GB) | 资源利用率提升 |
+| 样本吞吐量 | 274 samples/sec | 389 samples/sec | **提升 42%** |
+
+**优化前后总训练时间对比：**
+
+| 配置 | 总步数 | Steps/Sec | 总时间 | 节省 |
+|------|--------|-----------|--------|------|
+| 优化前 (BS=256) | 500K | 1.07 | ~130 小时 | - |
+| 优化后 (BS=512) | 250K | 0.76 | ~91 小时 | **~39 小时** |
+
+#### 单卡训练性能
 
 | 配置 | 设备 | 模型 | Steps/Sec | 备注 |
 |------|------|------|-----------|------|
-| PyTorch + torch_npu | 1x 910B3 | DiT-XL/2 | TODO | |
-| MindSpore (pynative) | 1x 910B3 | DiT-XL/2 | TODO | |
 | MindSpore (graph, O1) | 1x 910B3 | DiT-B/2 | 0.02 | 图编译时间长，不实用 |
 | MindSpore (pynative) | 1x 910B3 | DiT-B/2 | 3.34 | |
+
+#### 断点续训
+
+训练脚本支持从 checkpoint 恢复，自动恢复模型权重、EMA 权重和训练步数：
+
+```bash
+# 从 step 140000 的 checkpoint 恢复训练
+msrun --worker_num=8 --local_worker_num=8 \
+  --master_addr=127.0.0.1 --master_port=12345 \
+  --join=True \
+  python ms_train.py \
+    --data-path /path/to/imagenet \
+    --model DiT-XL/2 --image-size 256 \
+    --global-batch-size 512 --max-steps 250000 \
+    --amp --dtype bf16 --amp-level O2 \
+    --vae-path /path/to/sd-vae-ft-mse \
+    --num-workers 8 --ckpt-every 25000 \
+    --exec-mode pynative \
+    --ckpt results/001-DiT-XL-2/checkpoints/0140000.ckpt
+```
 
 ### 5.2 推理性能
 
@@ -431,33 +480,36 @@ MindSpore 使用的 `mindone.models.dit.DiT_models` 与 PyTorch 的 `models.DiT_
 | 配置 | 设备 | 推理时间 | it/s | 备注 |
 |------|------|---------|------|------|
 | PyTorch + torch_npu | 1x 910B3 | ~32s | ~7.8 | |
-| MindSpore (pynative) | 1x 910B3 | ~24s | ~10.4 | |
+| MindSpore (pynative) | 1x 910B3 | ~24s | ~10.4 | MindSpore 推理更快 |
 
 #### 多卡推理 (DiT-XL/2, 256x256, 250 steps, 8卡)
 
 | 配置 | 设备 | 16张图片耗时 | 备注 |
 |------|------|------------|------|
-| PyTorch + torch_npu | 8x 910B3 | TODO | |
-| MindSpore (pynative) | 8x 910B3 | TODO | |
+| PyTorch + torch_npu | 8x 910B3 | ~31s | |
+| MindSpore (pynative) | 8x 910B3 | ~34s | |
 
 ### 5.3 910B3 vs A100 性能对比
 
 | 任务 | 8x A100 (80GB) | 8x 910B3 (64GB) | 差距 |
 |------|---------------|----------------|------|
-| 训练 (steps/sec) | ~1.75 | ~1.05 | 910B3 慢 40% |
-| 推理 (单卡, 250步) | TODO | ~24s | TODO |
-| 内存使用 | TODO | ~37GB/NPU | TODO |
+| 训练 (BS=256, steps/sec) | ~1.75 | ~1.07 | 910B3 慢 40% |
+| 训练优化后 (BS=512, samples/sec) | TODO | 389 | TODO |
+| 推理 (单卡, 250步) | TODO | ~24s (MS) / ~32s (PT) | TODO |
+| HBM 使用 (BS=256) | TODO | ~37GB/NPU | TODO |
+| HBM 使用 (BS=512) | TODO | ~51GB/NPU | TODO |
 
 ### 5.4 PyTorch vs MindSpore 推理输出对比
 
 | 指标 | 值 | 说明 |
 |------|---|------|
-| 权重差异 | 0 | 完全一致 |
+| 权重差异 | 0 | 完全一致（292个参数） |
 | 模型前向传播差异 | < 0.001 | 数值精度差异 |
 | CFG 前向传播差异 | < 0.001 | 数值精度差异 |
+| VAE 解码差异 | < 0.001 | 数值精度差异 |
 | 最终图片像素差异 | ~60 | 随机数生成器不同导致 |
 
-> **注：** PyTorch 和 MindSpore 使用不同的随机数生成器，即使设置相同种子，生成的随机数序列也不同。这导致推理输出的图片在像素级别有差异，但视觉上相似。
+> **注：** PyTorch 和 MindSpore 使用不同的随机数生成器，即使设置相同种子，生成的随机数序列也不同。这导致推理输出的图片在像素级别有差异，但视觉上相似。模型权重、前向传播逻辑、CFG 实现、diffusion 采样调度完全一致。
 
 ---
 
