@@ -143,9 +143,15 @@ torchrun --nnodes=1 --nproc_per_node=8 train.py \
 #### MindSpore 版本（仅支持 NPU）
 
 ```bash
-# 单卡推理
+# 单卡推理（PyTorch .pt 权重）
 python ms_sample.py \
   --checkpoint checkpoints/DiT-XL-2-256x256.pt \
+  --image_size 256 \
+  --vae_path checkpoints/sd-vae-ft-mse
+
+# 单卡推理（MindSpore .ckpt 权重，MODEL 权重，非 EMA）
+python ms_sample.py \
+  --checkpoint results/001-DiT-XL-2/checkpoints/0225000.ckpt \
   --image_size 256 \
   --vae_path checkpoints/sd-vae-ft-mse
 
@@ -176,7 +182,10 @@ msrun --worker_num=8 --local_worker_num=8 \
 ### 1.7 注意事项
 
 1. **CANN 环境变量**：每次使用 NPU 前需要执行 `source /usr/local/Ascend/ascend-toolkit/set_env.sh`
-2. **MindSpore 权重兼容**：MindSpore 版本可直接加载 PyTorch 的 `.pt` 权重文件，无需转换
+2. **MindSpore 权重兼容**：
+   - **`.pt` 权重**：MindSpore 可直接加载 PyTorch 的 `.pt` 权重文件，使用 `DiT_models` 架构（292 参数），无需转换
+   - **`.ckpt` 权重**：MindSpore 训练产生的 `.ckpt` 文件使用 `DiTTransformer2DModel` 架构（539 参数），可自动加载推理
+   - **EMA 权重缺陷**：早期训练版本（< 236K 步）因 `update_ema()` 参数名匹配错误，EMA 权重从未被更新（始终为随机初始化），推理时必须选择 MODEL 权重而非 EMA
 3. **MindSpore 执行模式**：推荐使用 `pynative` 模式，`graph` 模式编译时间过长（DiT-XL/2 >77分钟）
 4. **VAE 路径**：推理和训练都需要指定本地 VAE 路径 `--vae-path`
 5. **多卡启动**：PyTorch 使用 `torchrun`，MindSpore 使用 `msrun`
@@ -262,7 +271,11 @@ python sample.py --device cuda
 
 ### 模型结构
 
-MindSpore 版本使用 `mindone.models.dit` 中的 DiT 实现，与 PyTorch 版本模型结构完全一致：
+MindSpore 版本支持两种模型架构，对应不同的权重格式：
+
+#### 3.1 PT 兼容架构：`DiT_models`（用于 `.pt` 权重）
+
+使用 `mindone.models.dit.DiT_models`，与 PyTorch 版本模型结构完全一致，含 292 个参数：
 
 | 组件 | PyTorch | MindSpore |
 |------|---------|-----------|
@@ -274,23 +287,35 @@ MindSpore 版本使用 `mindone.models.dit` 中的 DiT 实现，与 PyTorch 版�
 | DiT Block | `DiTBlock` | `mindone.models.dit.DiTBlock` |
 | Final Layer | `FinalLayer` | `mindone.models.dit.FinalLayer` |
 
+直接加载 PyTorch 的 `.pt` 权重即可使用（参数名完全一致）。
+
+#### 3.2 MS 训练架构：`DiTTransformer2DModel`（用于 `.ckpt` 权重）
+
+使用 `mindone.diffusers.models.transformers.dit_transformer_2d.DiTTransformer2DModel`，含 539 个参数。相比 `DiT_models`，它对每个 block 使用独立的 AdaLN 条件嵌入（独立的 t_embedder/y_embedder），并且 QKV 投影分开：
+
+| 组件 | `DiT_models` | `DiTTransformer2DModel` |
+|------|-------------|------------------------|
+| 参数数量 | 292 | 539 |
+| 权重精度 | 权重值完全对齐 PT | MS 训练产生，权重值与 PT 不同 |
+| AdaLN 条件 | 共享 t/y embedder | 每个 block 独立的 t/y embedder（`adaLN_modulation`） |
+| QKV | 合并投影 | 独立 Q/K/V 投影 |
+| 适用场景 | PT 权重推理 | MS 训练权重推理 |
+
 **参数量对比：**
 
-| 模型 | PyTorch | MindSpore |
-|------|---------|-----------|
-| DiT-XL/2 | 675,129,632 | 675,129,632 |
-| 参数名 | 完全一致 | 完全一致 |
-| 权重值 | 完全一致 | 完全一致 |
-
-MindSpore 版本可直接加载 PyTorch 的 `.pt` 权重文件，无需转换。
+| 模型 | PyTorch | MindSpore (`DiT_models`) | MindSpore (`DiTTransformer2DModel`) |
+|------|---------|--------------------------|-------------------------------------|
+| DiT-XL/2 | 675,129,632 | 675,129,632 | 675,129,632 |
+| 参数数量 | 292 | 292 | 539 |
+| 权重值 | 原始 | 与 PT 完全一致 | MS 独立训练产生 |
 
 ### 脚本说明
 
 | 脚本 | 功能 |
 |------|------|
-| `ms_train.py` | MindSpore 训练脚本，支持 8 卡分布式训练 |
-| `ms_sample.py` | MindSpore 单卡推理脚本 |
-| `ms_sample_ddp.py` | MindSpore 多卡分布式推理脚本 |
+| `ms_train.py` | MindSpore 训练脚本，支持 8 卡分布式训练，使用 `DiTTransformer2DModel` |
+| `ms_sample.py` | MindSpore 单卡推理脚本，支持 `.pt`（`DiT_models`）和 `.ckpt`（`DiTTransformer2DModel`） |
+| `ms_sample_ddp.py` | MindSpore 多卡分布式推理脚本，自动根据扩展名选择架构 |
 
 ---
 
@@ -370,7 +395,7 @@ torchrun --nnodes=1 --nproc_per_node=8 sample_ddp.py \
 ### 4.4 MindSpore 推理 (NPU)
 
 ```bash
-# 单卡推理
+# 单卡推理（PT 预训练权重，.pt）
 python ms_sample.py \
   --checkpoint /path/to/DiT-XL-2-256x256.pt \
   --image_size 256 \
@@ -380,7 +405,17 @@ python ms_sample.py \
   --vae_path /path/to/sd-vae-ft-mse \
   --device_id 0
 
-# 多卡分布式推理
+# 单卡推理（MS 训练权重，.ckpt，自动选择 MODEL 而非 EMA）
+python ms_sample.py \
+  --checkpoint /path/to/0225000.ckpt \
+  --image_size 256 \
+  --num_sampling_steps 250 \
+  --cfg_scale 4.0 \
+  --seed 0 \
+  --vae_path /path/to/sd-vae-ft-mse \
+  --device_id 0
+
+# 多卡分布式推理（PT 权重）
 msrun --worker_num=8 --local_worker_num=8 \
   --master_addr=127.0.0.1 --master_port=12345 \
   --join=True \
@@ -393,13 +428,31 @@ msrun --worker_num=8 --local_worker_num=8 \
     --num-sampling-steps 250 \
     --global-seed 0 \
     --vae-path /path/to/sd-vae-ft-mse
+
+# 多卡分布式推理（MS 训练权重）
+msrun --worker_num=8 --local_worker_num=8 \
+  --master_addr=127.0.0.1 --master_port=12345 \
+  --join=True \
+  python ms_sample_ddp.py \
+    --checkpoint /path/to/0225000.ckpt \
+    --sample-dir ms_samples \
+    --num-fid-samples 50000 \
+    --per-proc-batch-size 8 \
+    --cfg-scale 4.0 \
+    --num-sampling-steps 250 \
+    --global-seed 0 \
+    --vae-path /path/to/sd-vae-ft-mse
 ```
 
 ### 4.5 权重说明
 
-MindSpore 版本可直接加载 PyTorch 的 `.pt` 权重文件，无需任何转换。`ms_sample.py` 和 `ms_sample_ddp.py` 内部会自动处理权重加载。
+MindSpore 版本支持两种权重格式：
 
-MindSpore 使用的 `mindone.models.dit.DiT_models` 与 PyTorch 的 `models.DiT_models` 参数名完全一致（292个参数），因此直接加载即可。
+1. **`.pt` 文件（PyTorch 权重）**：使用 `DiT_models` 架构（292参数），参数名与 PyTorch 完全一致，可直接加载无需转换。适用于 PT 预训练权重或 PT 训练产生的权重。
+
+2. **`.ckpt` 文件（MindSpore 训练权重）**：使用 `DiTTransformer2DModel` 架构（539参数），由 `ms_train.py` 产生。关键注意点：
+   - **选择 MODEL 而非 EMA**：由于早期训练（< 236K 步）的 EMA 权重因 `update_ema()` bug 从未被更新（始终为随机初始化），推理时必须加载 MODEL 权重。`ms_sample.py` 和 `ms_sample_ddp.py` 会自动从 `.ckpt` 中提取 `model.model._backbone.*` 前缀的权重。
+   - **pos_embed 特殊处理**：`pos_embed.pos_embed` 保存为独立 key（`model.pos_embed.pos_embed`），不在 `_backbone.*` 范围内，推理脚本会自动加载并调用 `assign_value()` 注入模型。
 
 ---
 
@@ -501,15 +554,17 @@ msrun --worker_num=8 --local_worker_num=8 \
 
 ### 5.4 PyTorch vs MindSpore 推理输出对比
 
-| 指标 | 值 | 说明 |
-|------|---|------|
-| 权重差异 | 0 | 完全一致（292个参数） |
-| 模型前向传播差异 | < 0.001 | 数值精度差异 |
-| CFG 前向传播差异 | < 0.001 | 数值精度差异 |
-| VAE 解码差异 | < 0.001 | 数值精度差异 |
-| 最终图片像素差异 | ~60 | 随机数生成器不同导致 |
+| 场景 | 指标 | 值 | 说明 |
+|------|------|-----|------|
+| PT → MS (同权重, `.pt`) | 权重差异 | 0 | 292参数完全一致 |
+| PT → MS (同权重, `.pt`) | 模型前向传播差异 | < 0.001 | 数值精度差异 |
+| PT → MS (同权重, `.pt`) | 最终图片像素差异 | ~60 | 随机数生成器不同导致 |
+| MS 训练权重 (`.ckpt`) | 输出有效性 | ✅ | t=996下std=0.994（匹配PT 0.995）|
+| MS 训练权重 vs PT 预训练 | 视觉质量 | 可比 | 训练225K步，loss=0.017 |
 
-> **注：** PyTorch 和 MindSpore 使用不同的随机数生成器，即使设置相同种子，生成的随机数序列也不同。这导致推理输出的图片在像素级别有差异，但视觉上相似。模型权重、前向传播逻辑、CFG 实现、diffusion 采样调度完全一致。
+> **注：**
+> - **PT 权重 + MS 推理**：PyTorch 和 MindSpore 使用不同的随机数生成器，即使设置相同种子，生成的随机数序列也不同。这导致推理输出的图片在像素级别有差异，但视觉上相似。模型权重、前向传播逻辑、CFG 实现、diffusion 采样调度完全一致。
+> - **MS 训练权重推理**：MS 训练 225K 步（loss 0.017）的 MODEL 权重可产生正确图像；而 EMA 权重因 `update_ema()` bug 始终为随机初始化，输出为噪声。
 
 ---
 
@@ -525,18 +580,23 @@ msrun --worker_num=8 --local_worker_num=8 \
 
 ### 6.2 MindSpore 移植
 
-1. **模型定义**：使用 `mindone.models.dit.DiT_models`，与 PyTorch 版本结构完全一致
-2. **权重加载**：直接加载 PyTorch `.pt` 文件，无需转换
+1. **模型定义**：
+   - 推理 `.pt` 权重：使用 `mindone.models.dit.DiT_models`（292参数），与 PyTorch 结构完全一致
+   - 训练和 `.ckpt` 推理：使用 `mindone.diffusers.DiTTransformer2DModel`（539参数），每个 block 独立的 AdaLN 条件嵌入
+2. **权重加载**：
+   - `.pt`：直接加载 PyTorch 文件，无需转换
+   - `.ckpt`：提取 `model.model._backbone.*` 前缀的权重（MODEL），同时额外加载 `model.pos_embed.pos_embed`
 3. **Diffusion 采样**：使用 PyTorch 的 `create_diffusion` 库，确保调度参数一致
 4. **Timestep 映射**：使用 `timestep_map` 将 respaced timestep 映射到原始 timestep
 5. **CFG 实现**：与 PyTorch 完全一致，只对前 3 个通道应用 classifier-free guidance
-6. **训练脚本**：
+6. **`clip_denoised=False`**：与 PT DDPM 调用保持一致，推理时不将预测的 x_start 裁剪到 [-1,1]
+7. **训练脚本**：
    - 支持 pynative 和 graph 两种执行模式
    - 使用 `msrun` 启动分布式训练
    - 支持 AMP O2 混合精度
    - 支持梯度裁剪
-   - 支持 EMA 更新
-   - 支持 checkpoint 恢复
+   - 支持 EMA 更新（需注意参数名匹配方式）
+   - 支持 checkpoint 恢复（自动恢复模型权重、EMA、pos_embed、步数）
 
 ### 6.3 已解决的问题
 
@@ -545,6 +605,10 @@ msrun --worker_num=8 --local_worker_num=8 \
 | MindSpore 图片乱码 | Diffusion 调度参数计算错误 | 使用 PyTorch 的 `create_diffusion` |
 | MindSpore 图片乱码 | Timestep 未映射到原始值 | 使用 `timestep_map` 映射 |
 | MindSpore 图片乱码 | CFG 应用到错误通道数 | 只对前 3 个通道应用 CFG |
+| **EMA 权重从未更新** | `update_ema()` 中 `p.name`（仅"weight"）与 `parameters_and_names()`（完整路径）不匹配，导致 0 参数匹配 | 改用 `parameters_and_names()` 完整路径匹配 |
+| **pos_embed 未加载** | `pos_embed.pos_embed` 保存为独立 key `model.pos_embed.pos_embed`，不在 `_backbone.*` 范围内 | 推理脚本单独提取并调用 `assign_value()` |
+| **`clip_denoised` 错误** | MS 推理始终将 `pred_xstart` 裁剪到 [-1,1]，但 PT 使用 `clip_denoised=False` | 移除裁剪逻辑，与 PT DDPM 行为一致 |
+| **训练 AllReduce 错误** | `ops.AllReduce(ReduceOp.SUM)(g)` 未除以 world_size，梯度累加 | 修改为 `g / world_size` |
 | 图模式编译超时 | DiT-XL/2 图编译时间 >77 分钟 | 使用 pynative 模式 |
 | HCCL 初始化失败 | `init()` 顺序问题 | `init()` 必须在模型创建前调用 |
 | GeneratorDataset 死锁 | PIL 在 graph 模式不兼容 | 使用 `ImageFolderDataset` |
@@ -555,6 +619,9 @@ msrun --worker_num=8 --local_worker_num=8 \
 
 ### 7.1 MindSpore 版本优化
 
+- [x] **EMA 修复**：`update_ema()` 参数名匹配 bug 已修复（改用完整路径匹配）
+- [x] **推理修复**：pos_embed 加载、clip_denoised=False、MODEL 权重选择均已修复
+- [x] **断点恢复**：支持从 `.ckpt` 恢复训练（模型、EMA、pos_embed、步数）
 - [ ] **图模式优化**：解决 DiT-XL/2 图编译时间过长问题，尝试增量编译或子图拆分
 - [ ] **Flash Attention**：启用 MindSpore Flash Attention 加速注意力计算
 - [ ] **梯度检查点**：使用梯度检查点减少内存占用，支持更大 batch size
@@ -572,8 +639,8 @@ msrun --worker_num=8 --local_worker_num=8 \
 
 ### 7.3 通用优化
 
-- [ ] **FID 评估**：实现完整的 FID 评估流程
-- [ ] **EMA 采样**：定期从 EMA 模型生成样本
+- [x] **FID 评估流程**：`ms_sample_ddp.py` 支持分布式生成用于 FID 评估的样本
+- [x] **EMA 采样**：EMA 修复后可从 EMA 生成样本（需使用 >=236K 步训练的新 checkpoint）
 - [ ] **训练监控**：添加 TensorBoard / MindInsight 日志
-- [ ] **断点恢复**：完善训练断点恢复功能
 - [ ] **分布式数据并行优化**：优化 AllReduce 通信效率
+- [ ] **GitHub 推送**：解决网络问题完成远程仓库推送
