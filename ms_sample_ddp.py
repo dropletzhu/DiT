@@ -15,6 +15,7 @@ import math
 from pathlib import Path
 from PIL import Image
 from tqdm import tqdm
+import torch
 
 if 'ASCEND_HOME_PATH' not in os.environ:
     _candidates = [
@@ -33,7 +34,6 @@ from mindspore import mint
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, '/data0/ms_models/mindone')
 
-from mindone.models.dit import DiT_models
 from mindone.diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 
 os.environ["ASCEND_SLOG_PRINT_TO_STDOUT"] = "0"
@@ -97,26 +97,62 @@ def main(args):
     # Load DiT model
     print(f"[Rank {rank}] Loading DiT model...")
     latent_size = args.image_size // 8
-    model = DiT_models[args.model](
-        input_size=latent_size,
-        num_classes=args.num_classes,
-        learn_sigma=True,
-    )
+    
+    if args.checkpoint and args.checkpoint.endswith('.ckpt'):
+        # MindSpore checkpoint from ms_train.py - use DiTTransformer2DModel
+        from mindone.diffusers.models.transformers.dit_transformer_2d import DiTTransformer2DModel
+        model = DiTTransformer2DModel(
+            in_channels=4,
+            out_channels=8,
+            patch_size=2,
+            num_attention_heads=16,
+            attention_head_dim=72,
+            num_layers=28,
+            sample_size=latent_size,
+            num_embeds_ada_norm=args.num_classes,
+        )
+    else:
+        # PyTorch checkpoint or no checkpoint - use DiT_models
+        from mindone.models.dit import DiT_models
+        model = DiT_models[args.model](
+            input_size=latent_size,
+            num_classes=args.num_classes,
+            learn_sigma=True,
+        )
     
     # Load checkpoint
     if args.checkpoint:
-        import torch
         if args.checkpoint.endswith('.pt'):
             pt_ckpt = torch.load(args.checkpoint, map_location='cpu')
             param_dict = {}
             for k, v in pt_ckpt.items():
                 param_dict[k] = ms.Parameter(ms.Tensor(v.numpy()))
         else:
-            param_dict = ms.load_checkpoint(args.checkpoint)
+            raw_ckpt = ms.load_checkpoint(args.checkpoint)
+            # Prefer MODEL weights over EMA (EMA was never updated during MS training)
+            model_keys = {k.replace("model.model._backbone.", ""): v for k, v in raw_ckpt.items() if k.startswith("model.model._backbone.")}
+            if model_keys:
+                param_dict = model_keys
+                if "model.pos_embed.pos_embed" in raw_ckpt:
+                    param_dict["pos_embed.pos_embed"] = raw_ckpt["model.pos_embed.pos_embed"]
+                print(f"[Rank {rank}] Using MODEL weights ({len(model_keys)} params)")
+            else:
+                param_dict = raw_ckpt
         
-        not_loaded = ms.load_param_into_net(model, param_dict, strict_load=False)
+        not_loaded, unmatched = ms.load_param_into_net(model, param_dict, strict_load=False)
         if not_loaded:
-            print(f"[Rank {rank}] Warning: {len(not_loaded)} parameters not loaded")
+            print(f"[Rank {rank}] Warning: {len(not_loaded)} parameters not loaded: {not_loaded[:5]}...")
+        if unmatched:
+            print(f"[Rank {rank}] Info: {len(unmatched)} checkpoint keys unmatched: {unmatched[:3]}...")
+        
+        # Handle pos_embed separately (not a Parameter, invisible to load_param_into_net)
+        if "pos_embed.pos_embed" in param_dict:
+            pe_ckpt = param_dict["pos_embed.pos_embed"]
+            pe_data = pe_ckpt.data if isinstance(pe_ckpt, ms.Parameter) else pe_ckpt
+            model.pos_embed.pos_embed.assign_value(pe_data)
+            print(f"[Rank {rank}] Manually set pos_embed.pos_embed from checkpoint")
+        else:
+            print(f"[Rank {rank}] WARNING: pos_embed.pos_embed not found")
     else:
         print(f"[Rank {rank}] No checkpoint provided, using randomly initialized model")
     
@@ -156,8 +192,6 @@ def main(args):
     pbar = range(iterations)
     pbar = tqdm(pbar) if rank == 0 else pbar
     
-    import torch
-    
     total = 0
     for _ in pbar:
         # Generate noise using PyTorch's RNG (matching PyTorch's seed scheme)
@@ -196,9 +230,8 @@ def main(args):
             sqrt_alpha_cumprod_t = ms.Tensor(np.array([np.sqrt(diffusion.alphas_cumprod[i])]), dtype=ms.float32)
             sqrt_one_minus_alpha_cumprod_t = ms.Tensor(np.array([np.sqrt(1.0 - diffusion.alphas_cumprod[i])]), dtype=ms.float32)
             
-            # Predict x_0
+            # Predict x_0 (no clamp - matches PT clip_denoised=False)
             pred_xstart = (x - sqrt_one_minus_alpha_cumprod_t * epsilon) / sqrt_alpha_cumprod_t
-            pred_xstart = mint.clamp(pred_xstart, -1.0, 1.0)
             
             # Compute posterior variance
             min_log = ms.Tensor(np.array([diffusion.posterior_log_variance_clipped[i]]), dtype=ms.float32)

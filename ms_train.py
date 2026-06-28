@@ -31,8 +31,6 @@ from mindspore import mint, nn, ops
 from mindspore.communication import init, get_rank, get_group_size, release
 from mindspore.ops import clip_by_global_norm
 import mindspore.dataset as ds
-import mindspore.multiprocessing as mp
-
 sys.path.insert(0, str(Path(__file__).parent))
 
 from mindone.diffusers.models.transformers.dit_transformer_2d import DiTTransformer2DModel
@@ -141,9 +139,15 @@ def _create_graph_dataset(data_dir, image_size, batch_size, num_workers, world_s
 #################################################################################
 
 def update_ema(ema_model, model, decay=0.9999):
-    """Step EMA model toward current model — same as PyTorch train.py."""
-    ema_params = {p.name: p for p in ema_model.get_parameters()}
-    model_params = {p.name: p for p in model.get_parameters()}
+    """Step EMA model toward current model — same as PyTorch train.py.
+    
+    CRITICAL: Use parameters_and_names() for BOTH models so that the
+    hierarchical parameter paths (e.g. 'transformer_blocks.0.norm1.linear.weight')
+    match exactly. Using p.name from get_parameters() is WRONG because p.name
+    returns just the local name (e.g. 'weight') which never matches the full path.
+    """
+    ema_params = dict(ema_model.parameters_and_names())
+    model_params = dict(model.parameters_and_names())
     for name, param in model_params.items():
         if name in ema_params:
             ema_p = ema_params[name]
@@ -155,6 +159,19 @@ def update_ema(ema_model, model, decay=0.9999):
 def requires_grad(model, flag=True):
     for p in model.get_parameters():
         p.requires_grad = flag
+
+
+def _ensure_pos_embed(ckpt_list, ema):
+    """Ensure pos_embed.pos_embed is in the save list (AMP O2 may drop it)."""
+    if any("pos_embed.pos_embed" in item["name"] for item in ckpt_list):
+        return ckpt_list
+    try:
+        pe = ema.pos_embed.pos_embed.data
+        ckpt_list.append({"name": "model.pos_embed.pos_embed", "data": pe})
+        ckpt_list.append({"name": "ema.pos_embed.pos_embed", "data": pe})
+    except AttributeError:
+        pass
+    return ckpt_list
 
 
 #################################################################################
@@ -261,6 +278,15 @@ def main(rank, args):
     n_params = sum(p.size for p in model.get_parameters())
     log(f"Model parameters: {n_params:,}")
 
+    # CRITICAL: Ensure pos_embed.pos_embed is in trainable parameters
+    # (MindSpore AMP O2 may drop it due to name conflict in PatchEmbed)
+    _has_pos = any(p.name == 'pos_embed.pos_embed' or p.name.endswith('.pos_embed.pos_embed') for p in model.get_parameters())
+    _ema_has_pos = any(p.name == 'pos_embed.pos_embed' or p.name.endswith('.pos_embed.pos_embed') for p in ema.get_parameters())
+    log(f"pos_embed in model params: {_has_pos}, in EMA params: {_ema_has_pos}")
+    if not _has_pos:
+        log("WARNING: pos_embed.pos_embed missing from model get_parameters()")
+        log("Will save via attribute access (ema.pos_embed.pos_embed.data)")
+
     # --------------------------------------------------------------------------
     #  Diffusion constants (linear schedule, same as PyTorch)
     # --------------------------------------------------------------------------
@@ -303,6 +329,15 @@ def main(rank, args):
         ema_keys = {k.replace("ema.", ""): v for k, v in ckpt.items() if k.startswith("ema.")}
         ms.load_param_into_net(model, model_keys)
         ms.load_param_into_net(ema, ema_keys)
+        # Manually load pos_embed.pos_embed (not in get_parameters() due to PatchEmbed naming conflict)
+        # Attribute access returns Tensor, not Parameter, so use assign_value.
+        for target, prefix in [(model, "model."), (ema, "ema.")]:
+            key = prefix + "pos_embed.pos_embed"
+            if key in ckpt:
+                pe_ckpt = ckpt[key]
+                pe_data = pe_ckpt.data if isinstance(pe_ckpt, ms.Parameter) else pe_ckpt
+                target.pos_embed.pos_embed.assign_value(pe_data)
+                log(f"Manually set {key} from checkpoint")
         meta_path = str(Path(args.ckpt).with_suffix("")) + "_meta.json"
         if os.path.exists(meta_path):
             with open(meta_path) as f:
@@ -339,25 +374,11 @@ def main(rank, args):
     grad_fn = ms.value_and_grad(loss_cell, None, model.trainable_params())
 
     for epoch in range(args.epochs):
-        if args.exec_mode == "graph":
-            dataset = _create_graph_dataset(
-                args.data_path, args.image_size, batch_size,
-                args.num_workers, world_size, rank,
-            )
-            dataset_iterator = dataset.create_tuple_iterator(num_epochs=1, output_numpy=True)
-        else:
-            raw_dataset = ImageNetDataset(image_paths, labels_list, args.image_size)
-            dataset = ds.GeneratorDataset(
-                source=raw_dataset,
-                column_names=["image", "label"],
-                num_shards=world_size,
-                shard_id=rank,
-                shuffle=True,
-                num_parallel_workers=args.num_workers,
-                python_multiprocessing=True,
-            )
-            dataset = dataset.batch(batch_size, drop_remainder=True)
-            dataset_iterator = dataset.create_tuple_iterator(num_epochs=1, output_numpy=True)
+        dataset = _create_graph_dataset(
+            args.data_path, args.image_size, batch_size,
+            args.num_workers, world_size, rank,
+        )
+        dataset_iterator = dataset.create_tuple_iterator(num_epochs=1, output_numpy=True)
 
         for numpy_images, numpy_labels in dataset_iterator:
             images = ms.Tensor(numpy_images, dtype=ms.float32)
@@ -393,9 +414,10 @@ def main(rank, args):
 
             # ---- Gradient all-reduce (distributed) ----
             if world_size > 1:
+                _reduced = []
                 for g in grads:
-                    ops.AllReduce(ops.ReduceOp.SUM)(g)
-                    g /= world_size
+                    _reduced.append(ops.AllReduce(ops.ReduceOp.SUM)(g) / world_size)
+                grads = tuple(_reduced)
 
             if args.grad_clip > 0:
                 grads = clip_by_global_norm(grads, clip_norm=args.grad_clip)
@@ -445,6 +467,7 @@ def main(rank, args):
                     ckpt_list.append({"name": "model." + p.name, "data": p.data})
                 for p in ema.get_parameters():
                     ckpt_list.append({"name": "ema." + p.name, "data": p.data})
+                ckpt_list = _ensure_pos_embed(ckpt_list, ema)
                 ckpt_path = str(Path(checkpoint_dir) / f"{train_steps:07d}.ckpt")
                 ms.save_checkpoint(ckpt_list, ckpt_path)
                 meta = {"train_steps": train_steps, "args": vars(args)}
@@ -461,6 +484,7 @@ def main(rank, args):
                         ckpt_list.append({"name": "model." + p.name, "data": p.data})
                     for p in ema.get_parameters():
                         ckpt_list.append({"name": "ema." + p.name, "data": p.data})
+                    ckpt_list = _ensure_pos_embed(ckpt_list, ema)
                     final_path = str(Path(checkpoint_dir) / f"final_{train_steps:07d}.ckpt")
                     ms.save_checkpoint(ckpt_list, final_path)
                     meta = {"train_steps": train_steps, "args": vars(args)}
@@ -481,6 +505,7 @@ def main(rank, args):
             ckpt_list.append({"name": "model." + p.name, "data": p.data})
         for p in ema.get_parameters():
             ckpt_list.append({"name": "ema." + p.name, "data": p.data})
+        ckpt_list = _ensure_pos_embed(ckpt_list, ema)
         final_path = str(Path(checkpoint_dir) / "final.ckpt")
         ms.save_checkpoint(ckpt_list, final_path)
         meta = {"train_steps": train_steps, "args": vars(args)}
@@ -508,7 +533,7 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=1400)
     parser.add_argument("--global-batch-size", type=int, default=256)
     parser.add_argument("--global-seed", type=int, default=0)
-    parser.add_argument("--vae-path", type=str, default="/home/ma-user/work/temp/sd-vae-ft-mse")
+    parser.add_argument("--vae-path", type=str, default="/data0/ms_models/DiT/checkpoints/sd-vae-ft-mse")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50000)
@@ -526,9 +551,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    if args.nproc_per_node > 1:
-        if args.nproc_per_node > args.num_workers:
-            args.num_workers = args.nproc_per_node
-        mp.spawn(main, args=(args,), nprocs=args.nproc_per_node)
-    else:
-        main(0, args)
+    # Multi-NPU: use msrun launcher (sets RANK_ID/RANK_SIZE)
+    #   msrun --worker_num=8 --local_worker_num=8 python3 ms_train.py [args]
+    # Single NPU: call directly
+    main(0, args)
